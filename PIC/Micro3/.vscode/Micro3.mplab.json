@@ -1,0 +1,66 @@
+{
+    "version": "1.9",
+    "configurations": [
+        {
+            "name": "default",
+            "id": "conf1",
+            "device": "PIC16F18446",
+            "imagePath": "./out/Micro3/default.elf",
+            "packs": [
+                {
+                    "name": "PIC16F1xxxx_DFP",
+                    "vendor": "Microchip",
+                    "version": "1.32.471"
+                }
+            ],
+            "fileSet": "default",
+            "toolchain": "default-XC8"
+        }
+    ],
+    "propertyGroups": [
+        {
+            "name": "default-XC8",
+            "type": "toolchain",
+            "provider": "microchip.toolchains:xc8@4.00",
+            "properties": {
+                "HI-TECH-COMP": {
+                    "extra-include-directories": [
+                        "include"
+                    ]
+                }
+            }
+        }
+    ],
+    "fileSets": [
+        {
+            "name": "default",
+            "files": [
+                { "include": "src/main.c" },
+                { "include": "src/bits_configuracion.c" },
+                { "include": "src/pines.c" },
+                { "include": "src/interrupciones.c" },
+                { "include": "src/temporizador.c" },
+                { "include": "src/uart.c" },
+                { "include": "src/adc.c" },
+                { "include": "src/encoder.c" },
+                { "include": "src/drv8871_pwm.c" },
+                { "include": "src/control_pid.c" },
+                { "include": "src/referencia.c" },
+                { "include": "src/protocolo.c" },
+                { "include": "src/telemetria.c" },
+                { "include": "include/configuracion.h" },
+                { "include": "include/pines.h" },
+                { "include": "include/interrupciones.h" },
+                { "include": "include/temporizador.h" },
+                { "include": "include/uart.h" },
+                { "include": "include/adc.h" },
+                { "include": "include/encoder.h" },
+                { "include": "include/drv8871_pwm.h" },
+                { "include": "include/control_pid.h" },
+                { "include": "include/referencia.h" },
+                { "include": "include/protocolo.h" },
+                { "include": "include/telemetria.h" }
+            ]
+        }
+    ]
+}

@@ -1,0 +1,1015 @@
+#!/usr/bin/env python3
+"""
+Interfaz de Usuario — Control Sistema Lineal
+Proyecto de Diseño Mecatrónica
+Integrantes: Juan Andrés Sánchez, Sofía Vega, Andrés Felipe Trujillo
+
+Habla con el PIC16F18446 a 115200 8N1.
+Cada muestra llega como: consigna_mm,posicion_mm,error_mm,salida_V
+Comandos: C, P, S, Z, D, A, Kp:, Ki:, Kd:
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import threading
+import time
+import queue
+from collections import deque
+import re
+import ctypes
+
+
+# Sin esto Windows escala la ventana y el texto queda borroso.
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+try:
+    import serial
+    import serial.tools.list_ports
+    HAS_SERIAL = True
+except ImportError:
+    HAS_SERIAL = False
+    print("[AVISO] pyserial no instalado  →  pip install pyserial")
+
+try:
+    import pyvisa
+    HAS_VISA = True
+except ImportError:
+    HAS_VISA = False
+    print("[AVISO] pyvisa no instalado    →  pip install pyvisa pyvisa-py")
+
+try:
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
+    print("[AVISO] matplotlib no instalado →  pip install matplotlib")
+
+
+BG      = "#0D1117"
+SURFACE = "#161B22"
+CARD    = "#161B22"
+CARD2   = "#1C2128"
+BORDER  = "#30363D"
+ACCENT  = "#1F6FEB"
+ACCENT2 = "#238636"
+CYAN    = "#00D4FF"
+WARN    = "#D29922"
+DANGER  = "#FF6B35"
+PURPLE  = "#BC8CFF"
+ORANGE  = "#F0883E"
+TEXT    = "#E6EDF3"
+TEXTDIM = "#8B949E"
+TEXTLOG = "#ADBAC7"
+
+FF  = "Segoe UI"
+FS  = 10
+FSL = 13
+FSH = 22
+
+BAUD_RATE  = 115200
+FS_HZ      = 150
+VENTANA_S  = 10
+MAX_PUNTOS = FS_HZ * 30
+LEFT_W     = 330
+POS_MIN    = -100.0
+POS_MAX    = 100.0
+
+UI_SCALE = 1.0
+
+# Cada muestra: consigna, posicion, error (1 decimal) y voltios (2).
+TELEMETRIA_RE = re.compile(
+    r"^([+-]?\d+\.\d),([+-]?\d+\.\d),([+-]?\d+\.\d),([+-]?\d+\.\d{2})$")
+# C responde el conteo crudo, el que se pega en CUENTAS_HOME.
+ENC_RE = re.compile(r"^ENC:(-?\d+)$")
+NUMERO_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
+
+
+def px(n):
+    return int(round(n * UI_SCALE))
+
+
+def sep_h(parent, pady=4):
+    f = tk.Frame(parent, bg=BORDER, height=1)
+    f.pack(fill="x", padx=0, pady=pady)
+    return f
+
+
+def card_frame(parent, title, title_color=ACCENT):
+    wrapper = tk.Frame(parent, bg=BORDER, bd=0)
+    title_bar = tk.Frame(wrapper, bg=CARD2)
+    title_bar.pack(fill="x")
+    tk.Label(title_bar, text=title,
+             font=(FF, FS, "bold"), bg=CARD2,
+             fg=title_color).pack(side="left", padx=10, pady=5)
+    body = tk.Frame(wrapper, bg=CARD2)
+    body.pack(fill="both", expand=True)
+    return wrapper, body
+
+
+class FlatButton(tk.Frame):
+    """Botón de un solo color. El texto y el fondo reciben el clic."""
+
+    def __init__(self, parent, text, command=None,
+                 bg_color=ACCENT, fg_color=TEXT,
+                 width=160, height=34,
+                 font_size=FS, bold=True, **kwargs):
+        super().__init__(parent, bg=bg_color,
+                         width=px(width), height=px(height),
+                         cursor="hand2")
+        self.pack_propagate(False)
+        self.grid_propagate(False)
+
+        self._bg  = bg_color
+        self._hbg = self._lighten(bg_color)
+        self._fg  = fg_color
+        self._cmd = command
+
+        self._lbl = tk.Label(
+            self, text=text, bg=bg_color, fg=fg_color,
+            font=(FF, font_size, "bold" if bold else "normal"),
+            cursor="hand2")
+        self._lbl.pack(expand=True, fill="both")
+
+        for w in (self, self._lbl):
+            w.bind("<Enter>",    lambda _e: self._hover(True))
+            w.bind("<Leave>",    lambda _e: self._hover(False))
+            w.bind("<Button-1>", lambda _e: self._click())
+
+    @staticmethod
+    def _lighten(hex_color):
+        h = hex_color.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        return "#{:02x}{:02x}{:02x}".format(
+            min(255, r + 30), min(255, g + 30), min(255, b + 30))
+
+    def _hover(self, on):
+        c = self._hbg if on else self._bg
+        self.config(bg=c)
+        self._lbl.config(bg=c)
+
+    def _click(self):
+        if self._cmd:
+            self._cmd()
+
+    def configure_text(self, text):
+        self._lbl.config(text=text)
+
+    def set_color(self, bg_color, fg_color=None):
+        self._bg  = bg_color
+        self._hbg = self._lighten(bg_color)
+        if fg_color:
+            self._fg = fg_color
+            self._lbl.config(fg=self._fg)
+        self.config(bg=self._bg)
+        self._lbl.config(bg=self._bg)
+
+
+def entry_row(parent, label_text, var, cmd, hint_color=ACCENT, w_label=12):
+    row = tk.Frame(parent, bg=CARD2)
+    row.pack(fill="x", expand=True, padx=14, pady=3)
+
+    tk.Label(row, text=label_text, font=(FF, FS),
+             bg=CARD2, fg=TEXTDIM, width=w_label,
+             anchor="w").pack(side="left")
+
+    FlatButton(row, "▶", command=cmd,
+               bg_color=hint_color, fg_color=BG,
+               width=36, height=30, font_size=FS).pack(side="right")
+
+    e = tk.Entry(row, textvariable=var, width=8,
+                 font=(FF, FS + 1), bg=SURFACE, fg=TEXT,
+                 insertbackground=ACCENT, relief="flat",
+                 bd=0, highlightthickness=1,
+                 highlightcolor=hint_color,
+                 highlightbackground=BORDER)
+    e.pack(side="left", fill="x", expand=True, padx=6, ipady=4)
+    e.bind("<Return>", lambda _: cmd())
+    return e
+
+
+class Riel(tk.Canvas):
+    """Regla de -100 a 100 mm. Naranja es la referencia, cian es el carro."""
+
+    def __init__(self, parent):
+        super().__init__(parent, bg=BG, height=px(78),
+                         highlightthickness=0, bd=0)
+        self._pos = None
+        self._ref = None
+        self.bind("<Configure>", lambda _e: self._dibujar())
+
+    def set_valores(self, pos, ref):
+        self._pos = pos
+        self._ref = ref
+        self._dibujar()
+
+    def _x(self, mm, x0, ancho):
+        t = (mm - POS_MIN) / (POS_MAX - POS_MIN)
+        return x0 + t * ancho
+
+    def _dibujar(self):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w < 40 or h < 20:
+            return
+
+        x0 = 28
+        x1 = w - 18
+        ancho = max(10, x1 - x0)
+        y = 28
+
+        self.create_line(x0, y, x1, y, fill=BORDER, width=3)
+        for mm, txt in ((-100, "-100"), (-50, "-50"), (0, "0"),
+                        (50, "50"), (100, "100")):
+            x = self._x(mm, x0, ancho)
+            self.create_line(x, y - 6, x, y + 6, fill=TEXTDIM)
+            self.create_text(x, y + 16, text=txt, fill=TEXTDIM,
+                             font=(FF, 8))
+
+        if self._ref is not None:
+            x = self._x(max(POS_MIN, min(POS_MAX, self._ref)), x0, ancho)
+            self.create_line(x, 8, x, y + 4, fill=ORANGE, width=2)
+            self.create_polygon(x - 5, 8, x + 5, 8, x, 16,
+                                fill=ORANGE, outline=ORANGE)
+
+        if self._pos is not None:
+            x = self._x(max(POS_MIN, min(POS_MAX, self._pos)), x0, ancho)
+            self.create_rectangle(x - 9, y - 11, x + 9, y + 7,
+                                  fill=CYAN, outline=CYAN)
+            self.create_text(w / 2, h - 8,
+                             text=f"{self._pos:.1f} mm",
+                             fill=CYAN, font=(FF, FS, "bold"))
+
+
+class SerialWorker(threading.Thread):
+    """Lee el puerto en otro hilo. A 150 Hz no se puede hacer desde la ventana."""
+    def __init__(self, port, baud, rx_queue):
+        super().__init__(daemon=True)
+        self.port      = port
+        self.baud      = baud
+        self.rx_queue  = rx_queue
+        self._tx_queue = queue.Queue()
+        self._ser      = None
+        self._running  = False
+
+    def run(self):
+        try:
+            self._ser = serial.Serial(self.port, self.baud, timeout=0.05)
+            self._running = True
+            self.rx_queue.put(("CONNECTED", None))
+            buf = ""
+            while self._running:
+                try:
+                    msg = self._tx_queue.get_nowait()
+                    self._ser.write((msg + "\n").encode("ascii"))
+                except queue.Empty:
+                    pass
+                n = self._ser.in_waiting
+                raw = self._ser.read(n if n else 1)
+                if not raw:
+                    continue
+                buf += raw.decode("ascii", errors="replace")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip().replace("\r", "")
+                    if line:
+                        self.rx_queue.put(("MSG", line))
+        except Exception as exc:
+            self.rx_queue.put(("ERROR", str(exc)))
+        finally:
+            if self._ser and self._ser.is_open:
+                self._ser.close()
+            self._running = False
+
+    def send(self, texto):
+        self._tx_queue.put(texto)
+
+    def stop(self):
+        self._running = False
+
+
+class SplashFrame(tk.Frame):
+    BAR_W = 360
+
+    def __init__(self, parent, on_done):
+        super().__init__(parent, bg=BG)
+        self._on_done  = on_done
+        self._progress = 0
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+        self._build()
+        self._animate()
+
+    def _build(self):
+        outer = tk.Frame(self, bg=BORDER)
+        outer.grid(row=0, column=0)
+        inner = tk.Frame(outer, bg=CARD2)
+        inner.pack(padx=1, pady=1)
+        pad = dict(padx=60)
+
+        tk.Frame(inner, bg=CARD2, height=40).pack()
+        tk.Label(inner, text="↔", font=(FF, 48),
+                 bg=CARD2, fg=ACCENT).pack(**pad)
+        tk.Label(inner, text="Control Sistema Lineal",
+                 font=(FF, FSH, "bold"), bg=CARD2,
+                 fg=TEXT).pack(pady=(8, 0), **pad)
+        tk.Label(inner, text="G U Í A   L I N E A L",
+                 font=(FF, FSL, "bold"), bg=CARD2,
+                 fg=ACCENT).pack(**pad)
+
+        tk.Frame(inner, bg=BORDER, height=1, width=px(380)).pack(pady=22)
+        tk.Label(inner, text="Proyecto de Diseño Mecatrónica",
+                 font=(FF, FS + 1, "italic"), bg=CARD2,
+                 fg=TEXTDIM).pack()
+        tk.Frame(inner, bg=CARD2, height=14).pack()
+        tk.Label(inner, text="Integrantes",
+                 font=(FF, FS, "bold"), bg=CARD2,
+                 fg=TEXTDIM).pack()
+        for nombre in ("Juan Andrés Sánchez",
+                       "Sofía Vega",
+                       "Andrés Felipe Trujillo"):
+            tk.Label(inner, text=f"  •  {nombre}",
+                     font=(FF, FSL), bg=CARD2, fg=TEXT).pack(pady=2)
+
+        tk.Frame(inner, bg=CARD2, height=28).pack()
+        bar_outer = tk.Frame(inner, bg=BORDER, height=3, width=px(self.BAR_W))
+        bar_outer.pack()
+        bar_outer.pack_propagate(False)
+        self._bar = tk.Frame(bar_outer, bg=ACCENT, height=3, width=0)
+        self._bar.place(x=0, y=0, height=3)
+
+        self._lbl_cargando = tk.Label(
+            inner, text="Iniciando...",
+            font=(FF, FS - 1), bg=CARD2, fg=TEXTDIM)
+        self._lbl_cargando.pack(pady=6)
+
+        self._btn_cont = FlatButton(
+            inner, "  Continuar  →",
+            command=self._on_done,
+            bg_color=ACCENT, fg_color=TEXT,
+            width=280, height=56, font_size=FSL + 1)
+        self._bottom_space = tk.Frame(inner, bg=CARD2, height=px(36))
+        self._bottom_space.pack()
+
+    def _animate(self):
+        if self._progress > 100:
+            self._lbl_cargando.config(text="Listo")
+            self._btn_cont.pack(pady=(10, 0), before=self._bottom_space)
+            return
+        self._progress += 2
+        self._bar.place(x=0, y=0, height=3,
+                        width=int(px(self.BAR_W) * self._progress / 100))
+        msgs = {0: "Iniciando...", 30: "Cargando módulos...",
+                60: "Buscando puertos COM...", 85: "Preparando interfaz..."}
+        for k, v in msgs.items():
+            if self._progress >= k:
+                self._lbl_cargando.config(text=v)
+        self.after(25, self._animate)
+
+
+class MainFrame(tk.Frame):
+
+    def __init__(self, parent):
+        super().__init__(parent, bg=BG)
+        self._worker   = None
+        self._rx_q     = queue.Queue()
+        self._t        = deque(maxlen=MAX_PUNTOS)
+        self._y_ref    = deque(maxlen=MAX_PUNTOS)
+        self._y_pos    = deque(maxlen=MAX_PUNTOS)
+        self._t0       = None
+        self._visa_inst = None
+        self._muestra  = None
+        self._graficar = False
+        self._buscando_home = False
+
+        self._build()
+        self._refresh_ports()
+        self._poll()
+
+    def _build(self):
+        self._build_header()
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=10, pady=(6, 10))
+        body.columnconfigure(0, weight=0, minsize=px(LEFT_W))
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+        self._build_left(body)
+        self._build_right(body)
+
+    def _build_header(self):
+        hdr = tk.Frame(self, bg=SURFACE, height=px(52))
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+
+        tk.Label(hdr, text="↔   CONTROL GUÍA LINEAL",
+                 font=(FF, FSL, "bold"),
+                 bg=SURFACE, fg=ACCENT).pack(side="left", padx=16)
+
+        self._lbl_status = tk.Label(
+            hdr, text="●  DESCONECTADO",
+            font=(FF, FS, "bold"), bg=SURFACE, fg=DANGER)
+        self._lbl_status.pack(side="right", padx=16)
+
+        tk.Label(hdr, text="115200 8N1",
+                 font=(FF, FS - 1), bg=SURFACE,
+                 fg=TEXTDIM).pack(side="right", padx=4)
+
+        self._btn_conn = FlatButton(
+            hdr, "CONECTAR", command=self._toggle_connect,
+            bg_color=ACCENT2, fg_color=TEXT,
+            width=120, height=30)
+        self._btn_conn.pack(side="right", padx=6, pady=11)
+
+        self._port_var = tk.StringVar()
+        self._port_cb = ttk.Combobox(
+            hdr, textvariable=self._port_var,
+            width=10, state="readonly", font=(FF, FS))
+        self._port_cb.pack(side="right", padx=4)
+
+        tk.Label(hdr, text="Puerto:", font=(FF, FS),
+                 bg=SURFACE, fg=TEXTDIM).pack(side="right", padx=(8, 2))
+
+        FlatButton(hdr, "↺", command=self._refresh_ports,
+                   bg_color=BORDER, fg_color=TEXT,
+                   width=28, height=28, bold=False).pack(
+                       side="right", padx=0, pady=11)
+
+    def _build_left(self, parent):
+        left = tk.Frame(parent, bg=BG, width=px(LEFT_W))
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        left.grid_propagate(False)
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(0, weight=5)
+        left.rowconfigure(1, weight=3)
+        left.rowconfigure(2, weight=4)
+        self._card_control(left)
+        self._card_lectura(left)
+        self._card_fuente(left)
+
+    def _big_button(self, parent, text, cmd, color):
+        FlatButton(parent, text, command=cmd,
+                   bg_color=color, fg_color=TEXT,
+                   width=1, height=36, font_size=FS).pack(
+                       fill="x", expand=True, padx=14, pady=3)
+
+    def _card_control(self, parent):
+        wrap, card = card_frame(parent, "Control", ACCENT)
+        wrap.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
+
+        self._big_button(card, "LEER ENCODER   (C)",
+                         lambda: self._enviar_simple("C", None), BORDER)
+        self._big_button(card, "IR AL HOME   (Z)",
+                         self._send_z, ACCENT)
+        self._big_button(card, "PARAR   (S)",
+                         lambda: self._enviar_simple("S", "Parado"), DANGER)
+
+        fila = tk.Frame(card, bg=CARD2)
+        fila.pack(fill="x", padx=14, pady=3)
+        fila.columnconfigure(0, weight=1, uniform="m")
+        fila.columnconfigure(1, weight=1, uniform="m")
+        FlatButton(fila, "DIGITAL  (D)",
+                   command=lambda: self._enviar_simple("D", "Digital"),
+                   bg_color=BORDER, fg_color=TEXT,
+                   width=1, height=34, font_size=FS).grid(
+                       row=0, column=0, sticky="ew", padx=(0, 4))
+        FlatButton(fila, "ANALÓGICA  (A)",
+                   command=lambda: self._enviar_simple("A", "Analógica"),
+                   bg_color=BORDER, fg_color=TEXT,
+                   width=1, height=34, font_size=FS).grid(
+                       row=0, column=1, sticky="ew", padx=(4, 0))
+
+        sep_h(card, pady=6)
+
+        self._pos_var = tk.StringVar(value="0.0")
+        self._kp_var  = tk.StringVar(value="1.5")
+        self._ki_var  = tk.StringVar(value="0")
+        self._kd_var  = tk.StringVar(value="0.07")
+
+        entry_row(card, "Pos (mm):", self._pos_var, self._send_pos)
+        entry_row(card, "Kp:", self._kp_var,
+                  lambda: self._send_ganancia("Kp", self._kp_var, 20.0),
+                  hint_color=PURPLE)
+        entry_row(card, "Ki:", self._ki_var,
+                  lambda: self._send_ganancia("Ki", self._ki_var, 20.0),
+                  hint_color=PURPLE)
+        entry_row(card, "Kd:", self._kd_var,
+                  lambda: self._send_ganancia("Kd", self._kd_var, 2.0),
+                  hint_color=PURPLE)
+
+        self._reset_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            card, text="La gráfica arranca en 0 al mandar P",
+            variable=self._reset_var,
+            bg=CARD2, fg=TEXTDIM, selectcolor=SURFACE,
+            activebackground=CARD2, activeforeground=TEXT,
+            font=(FF, FS - 1), anchor="w"
+        ).pack(fill="x", padx=12, pady=(2, 8))
+
+    def _card_lectura(self, parent):
+        wrap, card = card_frame(parent, "Lectura", CYAN)
+        wrap.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+
+        card.columnconfigure(0, weight=1)
+        card.columnconfigure(1, weight=1)
+        card.rowconfigure(0, weight=1)
+        card.rowconfigure(1, weight=1)
+
+        celdas = (
+            (0, 0, "POSICIÓN",  "_lbl_pos", CYAN),
+            (0, 1, "REFERENCIA", "_lbl_ref", ORANGE),
+            (1, 0, "ERROR",     "_lbl_err", PURPLE),
+            (1, 1, "SALIDA",    "_lbl_u",   ACCENT2),
+        )
+        for fila, col, titulo, attr, color in celdas:
+            cell = tk.Frame(card, bg=CARD2)
+            cell.grid(row=fila, column=col, sticky="nsew", pady=2)
+            tk.Label(cell, text=titulo, font=(FF, FS - 2, "bold"),
+                     bg=CARD2, fg=TEXTDIM).pack(expand=True, anchor="s")
+            lbl = tk.Label(cell, text="—", font=(FF, FSL, "bold"),
+                           bg=CARD2, fg=color)
+            lbl.pack(expand=True, anchor="n")
+            setattr(self, attr, lbl)
+
+        self._lbl_modo = tk.Label(
+            card, text="Modo: sin home",
+            font=(FF, FS - 1), bg=CARD2, fg=TEXTDIM)
+        self._lbl_modo.grid(row=2, column=0, columnspan=2, pady=(4, 0))
+        self._lbl_enc = tk.Label(
+            card, text="Encoder: —",
+            font=(FF, FS, "bold"), bg=CARD2, fg=ORANGE)
+        self._lbl_enc.grid(row=3, column=0, columnspan=2, pady=(0, 6))
+
+    def _card_fuente(self, parent):
+        wrap, card = card_frame(parent, "Fuente de poder", WARN)
+        wrap.grid(row=2, column=0, sticky="nsew")
+
+        row0 = tk.Frame(card, bg=CARD2)
+        row0.pack(fill="x", expand=True, padx=14, pady=3)
+        tk.Label(row0, text="VISA:", font=(FF, FS),
+                 bg=CARD2, fg=TEXTDIM, width=12,
+                 anchor="w").pack(side="left")
+        FlatButton(row0, "Buscar", command=self._scan_visa,
+                   bg_color=BORDER, fg_color=TEXT,
+                   width=64, height=30, font_size=FS - 1).pack(side="right")
+        self._visa_var = tk.StringVar()
+        self._visa_cb = ttk.Combobox(
+            row0, textvariable=self._visa_var, font=(FF, FS))
+        self._visa_cb.pack(side="left", fill="x", expand=True, padx=6)
+
+        self._volt_var = tk.StringVar(value="24.0")
+        self._curr_var = tk.StringVar(value="2.0")
+        self._visa_entry(card, "Voltaje (V):", self._volt_var)
+        self._visa_entry(card, "Corriente (A):", self._curr_var)
+
+        sep_h(card, pady=6)
+        self._big_button(card, "CONECTAR FUENTE", self._connect_visa, BORDER)
+
+        row_b = tk.Frame(card, bg=CARD2)
+        row_b.pack(fill="x", expand=True, padx=14, pady=(4, 8))
+        row_b.columnconfigure(0, weight=1, uniform="b")
+        row_b.columnconfigure(1, weight=1, uniform="b")
+        FlatButton(row_b, "ENCENDER", command=self._power_on,
+                   bg_color=ACCENT2, fg_color=TEXT,
+                   width=1, height=36, font_size=FS).grid(
+                       row=0, column=0, sticky="ew", padx=(0, 4))
+        FlatButton(row_b, "APAGAR", command=self._power_off,
+                   bg_color=DANGER, fg_color=TEXT,
+                   width=1, height=36, font_size=FS).grid(
+                       row=0, column=1, sticky="ew", padx=(4, 0))
+
+    def _visa_entry(self, parent, label, var):
+        row = tk.Frame(parent, bg=CARD2)
+        row.pack(fill="x", expand=True, padx=14, pady=3)
+        tk.Label(row, text=label, font=(FF, FS),
+                 bg=CARD2, fg=TEXTDIM, width=12,
+                 anchor="w").pack(side="left")
+        tk.Entry(row, textvariable=var,
+                 font=(FF, FS + 1), bg=SURFACE, fg=TEXT,
+                 insertbackground=WARN, relief="flat",
+                 bd=0, highlightthickness=1,
+                 highlightcolor=WARN,
+                 highlightbackground=BORDER).pack(
+                     side="left", fill="x", expand=True, padx=6, ipady=4)
+
+    def _build_right(self, parent):
+        right = tk.Frame(parent, bg=BG)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.rowconfigure(0, weight=3)
+        right.rowconfigure(1, weight=2)
+        right.columnconfigure(0, weight=1)
+        self._build_graph(right)
+        self._build_log(right)
+
+    def _build_graph(self, parent):
+        wrap, body = card_frame(parent, "Posición en el tiempo", CYAN)
+        wrap.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
+
+        barra = tk.Frame(body, bg=CARD2)
+        barra.pack(fill="x", padx=8, pady=(4, 0))
+        tk.Label(barra,
+                 text="Naranja: referencia     Cian: posición medida",
+                 font=(FF, FS - 1), bg=CARD2, fg=TEXTDIM).pack(side="left")
+        FlatButton(barra, "Limpiar", command=self._limpiar_grafica,
+                   bg_color=BORDER, fg_color=TEXT,
+                   width=80, height=26, font_size=FS - 1).pack(side="right")
+
+        self._riel = Riel(body)
+        self._riel.pack(side="bottom", fill="x", padx=6, pady=(0, 4))
+
+        if not HAS_MPL:
+            tk.Label(body, text="matplotlib no instalado\npip install matplotlib",
+                     bg=CARD2, fg=DANGER, font=(FF, FS)).pack(expand=True)
+            return
+
+        self._fig = Figure(figsize=(6, 3.2), dpi=96, facecolor=BG)
+        self._ax = self._fig.add_subplot(111)
+        self._ax.set_facecolor(BG)
+        self._ax.tick_params(colors=TEXTDIM, labelsize=8)
+        for sp in self._ax.spines.values():
+            sp.set_color(BORDER)
+        self._ax.set_xlabel("Tiempo (s)", color=TEXTDIM, fontsize=8)
+        self._ax.set_ylabel("Posición (mm)", color=TEXTDIM, fontsize=8)
+        self._ax.set_xlim(0, VENTANA_S)
+        self._ax.set_ylim(-110, 110)
+        self._ax.grid(True, color=BORDER, linewidth=0.6)
+        self._line_ref, = self._ax.plot(
+            [], [], color=ORANGE, linewidth=1.6, linestyle="--",
+            label="Referencia")
+        self._line_pos, = self._ax.plot(
+            [], [], color=CYAN, linewidth=1.8, label="Posición")
+        leg = self._ax.legend(loc="upper right", fontsize=8, frameon=False)
+        for txt in leg.get_texts():
+            txt.set_color(TEXTDIM)
+        self._fig.tight_layout(pad=0.8)
+
+        self._mpl = FigureCanvasTkAgg(self._fig, master=body)
+        self._mpl.get_tk_widget().pack(fill="both", expand=True,
+                                       padx=4, pady=4)
+
+    def _build_log(self, parent):
+        wrap, body = card_frame(parent, "Terminal", ACCENT)
+        wrap.grid(row=1, column=0, sticky="nsew")
+
+        inner = tk.Frame(body, bg=CARD2)
+        inner.pack(fill="both", expand=True, padx=4, pady=(2, 6))
+
+        self._log = tk.Text(
+            inner, bg=BG, fg=TEXTLOG,
+            font=("Consolas", 9), relief="flat",
+            wrap="word", state="disabled",
+            selectbackground=ACCENT, insertbackground=ACCENT)
+        sb = tk.Scrollbar(inner, orient="vertical",
+                          command=self._log.yview,
+                          bg=SURFACE, troughcolor=BG,
+                          activebackground=ACCENT)
+        self._log.config(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._log.pack(side="left", fill="both", expand=True)
+
+        self._log.tag_config("ts",    foreground="#455a64")
+        self._log.tag_config("ok",    foreground=ACCENT2)
+        self._log.tag_config("err",   foreground=DANGER)
+        self._log.tag_config("send",  foreground=PURPLE)
+        self._log.tag_config("sys",   foreground=TEXTDIM)
+        self._log.tag_config("plain", foreground=TEXTLOG)
+        self._log.tag_config("adc",   foreground=ORANGE)
+
+    def _refresh_ports(self):
+        if HAS_SERIAL:
+            ports = [p.device for p in serial.tools.list_ports.comports()]
+        else:
+            ports = []
+        self._port_cb["values"] = ports
+        if ports:
+            self._port_cb.set(ports[-1])
+
+    def _toggle_connect(self):
+        if self._worker and self._worker._running:
+            self._disconnect()
+        else:
+            self._connect()
+
+    def _connect(self):
+        port = self._port_var.get()
+        if not port:
+            messagebox.showerror("Sin puerto", "Selecciona un puerto COM.")
+            return
+        if not HAS_SERIAL:
+            messagebox.showerror("pyserial faltante", "pip install pyserial")
+            return
+        self._rx_q = queue.Queue()
+        self._worker = SerialWorker(port, BAUD_RATE, self._rx_q)
+        self._t0 = time.time()
+        self._worker.start()
+
+    def _disconnect(self):
+        if self._worker:
+            self._worker.stop()
+            self._worker = None
+        self._lbl_status.config(text="●  DESCONECTADO", fg=DANGER)
+        self._btn_conn.configure_text("CONECTAR")
+        self._btn_conn.set_color(ACCENT2, TEXT)
+        self._log_add("sys", "Puerto cerrado")
+
+    def _send(self, cmd):
+        if self._worker and self._worker._running:
+            self._worker.send(cmd)
+            self._log_add("send", f"→  {cmd}")
+            return True
+        self._log_add("err", "No hay puerto abierto")
+        return False
+
+    def _enviar_simple(self, cmd, modo):
+        if self._send(cmd) and modo:
+            self._lbl_modo.config(text=f"Modo: {modo}")
+
+    def _send_z(self):
+        self._buscando_home = True
+        self._enviar_simple("Z", "Buscando home")
+
+    def _leer_numero(self, texto):
+        t = texto.strip().replace(",", ".")
+        if not NUMERO_RE.fullmatch(t):
+            return None
+        return t, float(t)
+
+    def _send_pos(self):
+        parsed = self._leer_numero(self._pos_var.get())
+        if parsed is None:
+            self._log_add("err", "La posición tiene que ser un número")
+            return
+        _, valor = parsed
+        if valor < POS_MIN or valor > POS_MAX:
+            self._log_add("err", "La posición va de -100.0 a 100.0 mm")
+            return
+        if self._reset_var.get():
+            self._limpiar_grafica()
+        if self._send(f"P{valor:.1f}"):
+            self._lbl_modo.config(text="Modo: digital")
+
+    def _send_ganancia(self, nombre, var, tope):
+        parsed = self._leer_numero(var.get())
+        if parsed is None:
+            self._log_add("err", f"{nombre} tiene que ser un número")
+            return
+        texto, valor = parsed
+        if valor < 0 or valor > tope:
+            self._log_add("err", f"{nombre} va de 0 a {tope:g}")
+            return
+        self._send(f"{nombre}:{texto}")
+
+    def _limpiar_grafica(self):
+        self._t.clear()
+        self._y_ref.clear()
+        self._y_pos.clear()
+        self._t0 = time.time()
+        self._graficar = True
+        self._pintar()
+
+    def _poll(self):
+        # Se vacía la cola y se pinta una vez. Si se dibuja cada muestra, la ventana se traba.
+        try:
+            while True:
+                kind, data = self._rx_q.get_nowait()
+                if kind == "CONNECTED":
+                    self._lbl_status.config(text="●  CONECTADO", fg=ACCENT2)
+                    self._btn_conn.configure_text("DESCONECTAR")
+                    self._btn_conn.set_color(DANGER, TEXT)
+                    self._log_add("sys", "Puerto abierto, 115200 8N1")
+                elif kind == "MSG":
+                    self._handle_msg(data)
+                elif kind == "ERROR":
+                    self._lbl_status.config(text="●  ERROR", fg=DANGER)
+                    self._btn_conn.configure_text("CONECTAR")
+                    self._btn_conn.set_color(ACCENT2, TEXT)
+                    self._worker = None
+                    self._log_add("err", data)
+        except queue.Empty:
+            pass
+
+        if self._graficar:
+            self._aplicar_lectura()
+            self._pintar()
+            self._graficar = False
+        self.after(50, self._poll)
+
+    def _handle_msg(self, msg):
+        m = TELEMETRIA_RE.match(msg)
+        if m:
+            if self._t0 is None:
+                self._t0 = time.time()
+            ref = float(m.group(1))
+            pos = float(m.group(2))
+            err = float(m.group(3))
+            vol = float(m.group(4))
+            self._t.append(time.time() - self._t0)
+            self._y_ref.append(ref)
+            self._y_pos.append(pos)
+            self._muestra = (ref, pos, err, vol)
+            self._graficar = True
+            return
+
+        m = ENC_RE.match(msg)
+        if m:
+            self._lbl_enc.config(text=f"Encoder: {m.group(1)}")
+            self._log_add("adc", f"ENC {m.group(1)}    pégalo en CUENTAS_HOME")
+            return
+        if msg == "RDY":
+            self._log_add("sys", "PIC listo")
+            return
+        if msg == "OK HOME":
+            self._buscando_home = False
+            self._lbl_modo.config(text="Modo: en el home")
+            self._log_add("ok", "Llegó al conteo del home")
+            return
+        if msg == "ERR HOME":
+            if self._buscando_home:
+                self._lbl_modo.config(text="Modo: no encontró el home")
+                self._log_add("err", "Z no llegó al conteo de CUENTAS_HOME")
+            else:
+                self._lbl_modo.config(text="Modo: sin home")
+                self._log_add("err", "Primero manda Z")
+            self._buscando_home = False
+            return
+        if msg == "ERR RANGO":
+            self._log_add("err", "Fuera de rango")
+            return
+        if msg == "ERR VALOR":
+            self._log_add("err", "El PIC no entendió el comando")
+            return
+        if msg == "OK":
+            self._log_add("ok", "OK")
+            return
+        if msg.startswith("ERR"):
+            self._log_add("err", msg)
+            return
+        self._log_add("plain", msg)
+
+    def _aplicar_lectura(self):
+        if not self._muestra:
+            return
+        ref, pos, err, vol = self._muestra
+        self._lbl_pos.config(text=f"{pos:.1f}")
+        self._lbl_ref.config(text=f"{ref:.1f}")
+        self._lbl_err.config(text=f"{err:.1f}")
+        self._lbl_u.config(text=f"{vol:.2f} V")
+        self._riel.set_valores(pos, ref)
+
+    def _pintar(self):
+        if not HAS_MPL:
+            return
+        xs = list(self._t)
+        if not xs:
+            self._line_ref.set_data([], [])
+            self._line_pos.set_data([], [])
+            self._ax.set_xlim(0, VENTANA_S)
+            self._mpl.draw_idle()
+            return
+
+        self._line_ref.set_data(xs, list(self._y_ref))
+        self._line_pos.set_data(xs, list(self._y_pos))
+
+        x_max = xs[-1]
+        # Los primeros 10 s se quedan fijos para que el escalón no se corra.
+        if x_max <= VENTANA_S:
+            self._ax.set_xlim(0, VENTANA_S)
+        else:
+            self._ax.set_xlim(x_max - VENTANA_S, x_max + 0.2)
+
+        ys = list(self._y_ref) + list(self._y_pos)
+        y0 = min(ys)
+        y1 = max(ys)
+        if y1 - y0 < 10.0:
+            medio = 0.5 * (y0 + y1)
+            y0, y1 = medio - 5.0, medio + 5.0
+        else:
+            holgura = 0.12 * (y1 - y0)
+            y0 -= holgura
+            y1 += holgura
+        self._ax.set_ylim(y0, y1)
+        self._mpl.draw_idle()
+
+    def _scan_visa(self):
+        if not HAS_VISA:
+            messagebox.showwarning("pyvisa", "pip install pyvisa pyvisa-py")
+            return
+        try:
+            rm = pyvisa.ResourceManager()
+            resources = list(rm.list_resources())
+            self._visa_cb["values"] = resources
+            if resources:
+                self._visa_cb.set(resources[0])
+            self._log_add("sys", f"VISA: {len(resources)} recurso(s)")
+        except Exception as exc:
+            self._log_add("err", f"VISA: {exc}")
+
+    def _connect_visa(self):
+        if not HAS_VISA:
+            messagebox.showwarning("pyvisa", "pip install pyvisa pyvisa-py")
+            return
+        res = self._visa_var.get().strip()
+        if not res:
+            messagebox.showwarning("VISA", "Escribe o elige el recurso VISA.")
+            return
+        try:
+            rm = pyvisa.ResourceManager()
+            self._visa_inst = rm.open_resource(res)
+            idn = self._visa_inst.query("*IDN?").strip()
+            self._log_add("ok", f"Fuente: {idn}")
+        except Exception as exc:
+            self._log_add("err", f"VISA: {exc}")
+
+    def _power_on(self):
+        if not self._visa_inst:
+            self._log_add("err", "Conecta la fuente primero")
+            return
+        try:
+            v = float(self._volt_var.get().replace(",", "."))
+            i = float(self._curr_var.get().replace(",", "."))
+            self._visa_inst.write(f"VOLT {v:.3f}")
+            self._visa_inst.write(f"CURR {i:.3f}")
+            self._visa_inst.write("OUTP ON")
+            self._log_add("ok", f"Fuente ON  {v:g} V  /  {i:g} A")
+        except Exception as exc:
+            self._log_add("err", f"VISA: {exc}")
+
+    def _power_off(self):
+        if not self._visa_inst:
+            self._log_add("err", "Conecta la fuente primero")
+            return
+        try:
+            self._visa_inst.write("OUTP OFF")
+            self._log_add("sys", "Fuente apagada")
+        except Exception as exc:
+            self._log_add("err", f"VISA: {exc}")
+
+    def _log_add(self, tag, msg):
+        ts = time.strftime("%H:%M:%S")
+        self._log.config(state="normal")
+        self._log.insert("end", f"[{ts}]", "ts")
+        self._log.insert("end", f"  {msg}\n", tag)
+        self._log.see("end")
+        self._log.config(state="disabled")
+
+
+class App(tk.Tk):
+
+    def __init__(self):
+        super().__init__()
+        self.title("Control Sistema Lineal")
+        self.configure(bg=BG)
+
+        global UI_SCALE
+        # tkinter mide en puntos. Esto lo pasa a los pixeles reales de la pantalla.
+        try:
+            dpi = self.winfo_fpixels("1i")
+            self.tk.call("tk", "scaling", dpi / 72.0)
+            UI_SCALE = dpi / 96.0
+        except Exception:
+            pass
+
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        w = max(1100, int(sw * 0.82))
+        h = max(700, int(sh * 0.82))
+        x = (sw - w) // 2
+        y = (sh - h) // 2
+        self.geometry(f"{w}x{h}+{x}+{y}")
+        self.minsize(1060, 680)
+        self._apply_style()
+        self._show_splash()
+
+    def _apply_style(self):
+        s = ttk.Style(self)
+        s.theme_use("default")
+        s.configure("TCombobox",
+                    fieldbackground=SURFACE,
+                    background=SURFACE,
+                    foreground=TEXT,
+                    arrowcolor=ACCENT,
+                    bordercolor=BORDER,
+                    insertcolor=TEXT)
+        s.map("TCombobox",
+              fieldbackground=[("readonly", SURFACE)],
+              selectbackground=[("readonly", CARD)],
+              selectforeground=[("readonly", TEXT)])
+
+    def _show_splash(self):
+        self._splash = SplashFrame(self, self._show_main)
+        self._splash.pack(fill="both", expand=True)
+
+    def _show_main(self):
+        self._splash.destroy()
+        MainFrame(self).pack(fill="both", expand=True)
+
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
