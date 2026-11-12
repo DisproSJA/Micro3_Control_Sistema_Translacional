@@ -11,6 +11,7 @@ void Control_Reiniciar(void);
 uint8_t Control_FijarKp(int16_t kp_milli);
 uint8_t Control_FijarKi(int16_t ki_milli);
 uint8_t Control_FijarKd(int16_t kd_milli);
-int16_t Control_Calcular(int32_t consigna, int32_t posicion);
+/* tope es la saturacion de esta muestra, en mV. */
+int16_t Control_Calcular(int32_t consigna, int32_t posicion, int16_t tope);
 
 #endif

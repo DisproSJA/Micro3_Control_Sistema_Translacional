@@ -184,3 +184,12 @@ uint8_t Referencia_Actualizar(int32_t *consigna_out, int16_t *milivoltios,
 
     return REF_PID;
 }
+
+/* El pot usa 8 V. P y Z usan los 24 V de la fuente. */
+int16_t Referencia_TopeMv(void)
+{
+    if (modo == MODO_ANALOGA) {
+        return VLIM_ANALOG_MV;
+    }
+    return VLIM_MV;
+}

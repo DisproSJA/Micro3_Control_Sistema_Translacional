@@ -69,8 +69,8 @@ uint8_t Control_FijarKd(int16_t valor)
     return 1;
 }
 
-/* Una muestra. Devuelve voltios en mV, ya recortados a ±VLIM_MV. */
-int16_t Control_Calcular(int32_t consigna, int32_t posicion)
+/* Una muestra. Devuelve voltios en mV, ya recortados a ±tope. */
+int16_t Control_Calcular(int32_t consigna, int32_t posicion, int16_t tope)
 {
     int32_t error;
     int32_t p_mv;
@@ -89,15 +89,22 @@ int16_t Control_Calcular(int32_t consigna, int32_t posicion)
     }
     p_mv = ((int32_t)kp_milli * error) / CUENTAS_POR_MM;
 
+    /* Si se acaba de bajar el tope, el integrador no se queda por encima. */
+    if (i_mv > tope) {
+        i_mv = tope;
+    } else if (i_mv < -tope) {
+        i_mv = -tope;
+    }
+
     i_antes = i_mv;
     if (ki_milli == 0) {
         i_mv = 0;
     } else {
         i_mv += ((int32_t)ki_milli * (error + e_prev)) / (DOS_SOBRE_TS * CUENTAS_POR_MM);
-        if (i_mv > VLIM_MV) {
-            i_mv = VLIM_MV;
-        } else if (i_mv < -VLIM_MV) {
-            i_mv = -VLIM_MV;
+        if (i_mv > tope) {
+            i_mv = tope;
+        } else if (i_mv < -tope) {
+            i_mv = -tope;
         }
     }
 
@@ -125,13 +132,13 @@ int16_t Control_Calcular(int32_t consigna, int32_t posicion)
 
     u = p_mv + i_mv + d_mv;
     congelar = 0;
-    if (u > VLIM_MV) {
-        u = VLIM_MV;
+    if (u > tope) {
+        u = tope;
         if (error > 0) {
             congelar = 1;
         }
-    } else if (u < -VLIM_MV) {
-        u = -VLIM_MV;
+    } else if (u < -tope) {
+        u = -tope;
         if (error < 0) {
             congelar = 1;
         }
@@ -141,10 +148,10 @@ int16_t Control_Calcular(int32_t consigna, int32_t posicion)
     if (congelar) {
         i_mv = i_antes;
         u = p_mv + i_mv + d_mv;
-        if (u > VLIM_MV) {
-            u = VLIM_MV;
-        } else if (u < -VLIM_MV) {
-            u = -VLIM_MV;
+        if (u > tope) {
+            u = tope;
+        } else if (u < -tope) {
+            u = -tope;
         }
     }
 

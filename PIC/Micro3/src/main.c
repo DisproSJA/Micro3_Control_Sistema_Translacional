@@ -25,7 +25,7 @@ void main(void)
     Pwm_Iniciar();                /* 31.25 kHz, motor suelto */
     Encoder_Iniciar();            /* x2 por hardware: Timer1, Timer5, CLC1 */
     Temporizador_Iniciar();       /* muestra de 150 Hz */
-    Control_Iniciar();            /* Kp 1.5, Ki 0, Kd 0.07, tope 24 V */
+    Control_Iniciar();            /* Kp 1.5, Ki 0, Kd 0.07 */
     Referencia_Iniciar();         /* el punto de encendido queda en 0 mm */
     Protocolo_Iniciar();
     Interrupciones_Habilitar();   /* Timer0, RX y ADC */
@@ -42,7 +42,8 @@ void main(void)
             posicion = Referencia_Posicion(Encoder_Posicion());
 
             if (salida == REF_PID) {
-                milivoltios = Control_Calcular(consigna, posicion);
+                milivoltios = Control_Calcular(consigna, posicion,
+                                               Referencia_TopeMv());
                 milivoltios = Referencia_AplicarFin(posicion, milivoltios);
                 Pwm_AplicarMv(milivoltios);
             } else if (salida == REF_VOLTAJE) {

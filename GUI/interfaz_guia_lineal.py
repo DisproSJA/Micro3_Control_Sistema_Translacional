@@ -772,13 +772,13 @@ class MainFrame(tk.Frame):
         self._lbl_ts.config(text="—")
         self._lbl_te.config(text="—")
         self._lbl_mp.config(text="—")
-        self._enviar_simple("A", "analógica")
+        self._enviar_simple("A", "analógica, tope 8 V")
 
     def _send_z(self):
         if self._reset_var.get():
             self._limpiar_grafica()
         self._nuevo_escalon(0.0)
-        self._enviar_simple("Z", "home")
+        self._enviar_simple("Z", "home, tope 24 V")
 
     def _leer_numero(self, texto):
         t = texto.strip().replace(",", ".")
@@ -802,7 +802,7 @@ class MainFrame(tk.Frame):
             self._limpiar_grafica()
         self._nuevo_escalon(valor)
         if self._send(f"P{valor:.1f}"):
-            self._lbl_modo.config(text="Modo: digital")
+            self._lbl_modo.config(text="Modo: digital, tope 24 V")
 
     def _send_limites(self):
         a = self._leer_numero(self._lim_min_var.get())
@@ -914,7 +914,7 @@ class MainFrame(tk.Frame):
             return
         if msg == "OK HOME":
             self._buscando_home = False
-            self._lbl_modo.config(text="Modo: en el home")
+            self._lbl_modo.config(text="Modo: en el home, tope 24 V")
             self._en_fallo = False
             self._log_add("ok", "Yendo a la posición de encendido")
             return

@@ -45,6 +45,9 @@ uint8_t Referencia_HayHome(void);
 /* Una muestra. adc es la lectura ya filtrada del potenciómetro. */
 uint8_t Referencia_Actualizar(int32_t *consigna, int16_t *milivoltios,
                               uint16_t adc);
+
+/* 8 V en analogica, 24 V en digital. */
+int16_t Referencia_TopeMv(void);
 uint8_t Referencia_TomarAviso(void);
 
 #endif
