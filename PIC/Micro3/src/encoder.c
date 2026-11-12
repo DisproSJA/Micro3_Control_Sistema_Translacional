@@ -1,7 +1,7 @@
 #include <xc.h>
 #include "encoder.h"
 #include "configuracion.h"
-
+    
 /* El conteo lo hacen los timers, sin interrupciones.
    Timer1 cuenta subidas de A con B en bajo.
    Timer5 cuenta bajadas de A con B en bajo. La CLC1 le da A negada.

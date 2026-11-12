@@ -32,10 +32,10 @@
 #define KI_MILLI_INICIAL                0
 #define KD_MILLI_INICIAL                70
 
-/* La fuente es de 24 V. El PID no pasa de 12 V. El PWM sigue
-   calculado sobre los 24 V. */
+/* La fuente es de 24 V y el PID satura ahi. El PWM sigue
+   calculado sobre esos mismos 24 V, asi que el tope es duty pleno. */
 #define VM_MV                           24000
-#define VLIM_MV                         12000
+#define VLIM_MV                         24000
 
 /* 65536 - 8000000/150. El timer cuenta Fosc/4. */
 #define TMR0_RECARGA                    12203U

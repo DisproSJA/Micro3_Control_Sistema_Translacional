@@ -10,7 +10,8 @@ Comandos: C, P, S, Z, D, A, Kp:, Ki:, Kd:
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
+import csv
 import threading
 import time
 import queue
@@ -397,6 +398,16 @@ class MainFrame(tk.Frame):
         self._paso_dibujar = False
         self._marca_ts = None
         self._marca_te = None
+        self._ts_s = None
+        self._mp_pct = None
+        # Ganancias con las que arranca el PIC. Se actualizan al enviarlas.
+        self._kp = 1.5
+        self._ki = 0.0
+        self._kd = 0.07
+        self._pruebas = []
+        self._ventana_pruebas = None
+        self._arbol_pruebas = None
+        self._lbls_prom = []
 
         self._build()
         self._refresh_ports()
@@ -420,6 +431,9 @@ class MainFrame(tk.Frame):
         tk.Label(hdr, text="↔   CONTROL GUÍA LINEAL",
                  font=(FF, FSL, "bold"),
                  bg=SURFACE, fg=ACCENT).pack(side="left", padx=16)
+        FlatButton(hdr, "PRUEBAS", command=self._abrir_pruebas,
+                   bg_color=BORDER, fg_color=TEXT,
+                   width=110, height=30).pack(side="left", pady=11)
 
         self._lbl_status = tk.Label(
             hdr, text="●  DESCONECTADO",
@@ -753,6 +767,8 @@ class MainFrame(tk.Frame):
         self._paso_dibujar = True
         self._marca_ts = None
         self._marca_te = None
+        self._ts_s = None
+        self._mp_pct = None
         self._lbl_ts.config(text="—")
         self._lbl_te.config(text="—")
         self._lbl_mp.config(text="—")
@@ -813,7 +829,13 @@ class MainFrame(tk.Frame):
         if valor < 0 or valor > tope:
             self._log_add("err", f"{nombre} va de 0 a {tope:g}")
             return
-        self._send(f"{nombre}:{texto}")
+        if self._send(f"{nombre}:{texto}"):
+            if nombre == "Kp":
+                self._kp = valor
+            elif nombre == "Ki":
+                self._ki = valor
+            else:
+                self._kd = valor
 
     def _limpiar_grafica(self):
         self._t.clear()
@@ -991,6 +1013,8 @@ class MainFrame(tk.Frame):
         self._paso_dibujar = True
         self._marca_ts = None
         self._marca_te = None
+        self._ts_s = None
+        self._mp_pct = None
         self._lbl_ts.config(text="—")
         self._lbl_te.config(text="—")
         self._lbl_mp.config(text="—")
@@ -1032,9 +1056,11 @@ class MainFrame(tk.Frame):
         if t10 is not None and t90 is not None and t90 >= t10:
             # La línea va en el 90 %: ahí ya se obtuvo ts y la señal está cerca.
             self._marca_ts = t90
-            self._lbl_ts.config(text=f"{t90 - t10:.3f} s")
+            self._ts_s = t90 - t10
+            self._lbl_ts.config(text=f"{self._ts_s:.3f} s")
             pico = yf - min(self._paso_y) if not sube else max(self._paso_y) - yf
-            self._lbl_mp.config(text=f"{max(0.0, pico) / abs(amp) * 100.0:.1f} %")
+            self._mp_pct = max(0.0, pico) / abs(amp) * 100.0
+            self._lbl_mp.config(text=f"{self._mp_pct:.1f} %")
 
         # te es el último cruce del borde del 2 %. Si la cola sigue afuera, no hay te.
         if abs(self._paso_y[-1] - yf) > banda:
@@ -1053,6 +1079,7 @@ class MainFrame(tk.Frame):
         if self._paso_t[-1] >= VENTANA_TE * te:
             self._paso_fijo = True
             self._paso_activo = False
+            self._anotar_prueba()
 
     def _estilo_escalon(self):
         ax = self._ax2
@@ -1133,6 +1160,306 @@ class MainFrame(tk.Frame):
             txt.set_color(TEXTDIM)
         self._fig2.tight_layout(pad=0.6)
         self._mpl2.draw_idle()
+
+    def _anotar_prueba(self):
+        # El escalón ya se quedó quieto. El error es referencia menos posición.
+        pos_fin = self._paso_y[-1]
+        self._pruebas.append({
+            "kp": self._kp,
+            "ki": self._ki,
+            "kd": self._kd,
+            "pos_in": self._paso_y0,
+            "ref_fin": self._paso_yf,
+            "pos_fin": pos_fin,
+            "error": self._paso_yf - pos_fin,
+            "ts": self._ts_s,
+            "te": self._marca_te,
+            "mp": self._mp_pct,
+            "en_promedio": True,
+        })
+        self._log_add("ok", f"Prueba {len(self._pruebas)} anotada")
+        self._refrescar_tabla(ir_al_final=True)
+
+    def _texto_prueba(self, i, p):
+        def num(valor, dec):
+            if valor is None:
+                return "—"
+            return f"{valor:.{dec}f}"
+
+        def ganancia(valor):
+            if valor is None:
+                return "—"
+            texto = f"{valor:.4f}".rstrip("0").rstrip(".")
+            return texto if texto else "0"
+
+        return (
+            str(i),
+            ganancia(p["kp"]),
+            ganancia(p["ki"]),
+            ganancia(p["kd"]),
+            num(p["pos_in"], 1),
+            num(p["ref_fin"], 1),
+            num(p["pos_fin"], 1),
+            num(p["error"], 1),
+            num(p["ts"], 3),
+            num(p["te"], 3),
+            num(p["mp"], 1),
+        )
+
+    def _abrir_pruebas(self):
+        win = self._ventana_pruebas
+        if win is not None and win.winfo_exists():
+            win.lift()
+            win.focus_force()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Pruebas")
+        win.configure(bg=BG)
+        win.transient(self.winfo_toplevel())
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        w = min(sw - 40, max(1280, int(sw * 0.92)))
+        h = min(sh - 80, max(680, int(sh * 0.78)))
+        win.minsize(1100, 560)
+        win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+        self._ventana_pruebas = win
+
+        tk.Label(win, text="Tabla de pruebas",
+                 font=(FF, FSL, "bold"), bg=BG, fg=TEXT).pack(
+                     anchor="w", padx=14, pady=(12, 0))
+        tk.Label(win,
+                 text="Se anota sola cuando el escalón se queda quieto. "
+                      "Clic en Incluir para meter o sacar esa prueba del promedio.",
+                 font=(FF, FS - 1), bg=BG, fg=TEXTDIM).pack(
+                     anchor="w", padx=14, pady=(0, 8))
+
+        columnas = (
+            ("uso", "Incluir", 84),
+            ("n", "N°", 48),
+            ("kp", "Kp", 70),
+            ("ki", "Ki", 70),
+            ("kd", "Kd", 70),
+            ("pos_in", "Pos. inicial (mm)", 124),
+            ("ref_fin", "Ref. final (mm)", 118),
+            ("pos_fin", "Pos. final (mm)", 124),
+            ("error", "Error (mm)", 96),
+            ("ts", "ts (s)", 78),
+            ("te", "te (s)", 78),
+            ("mp", "Mp (%)", 76),
+        )
+        estilo = ttk.Style(win)
+        estilo.configure("Pruebas.Treeview",
+                         background=BG, fieldbackground=BG, foreground=TEXT,
+                         bordercolor=BORDER, rowheight=px(32),
+                         font=(FF, FS + 1))
+        estilo.configure("Pruebas.Treeview.Heading",
+                         background=CARD2, foreground=TEXT,
+                         relief="flat", font=(FF, FS, "bold"))
+        estilo.map("Pruebas.Treeview",
+                   background=[("selected", ACCENT)],
+                   foreground=[("selected", TEXT)])
+        estilo.map("Pruebas.Treeview.Heading",
+                   background=[("active", SURFACE)])
+
+        marco = tk.Frame(win, bg=BORDER, bd=0)
+        marco.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        ids = [c[0] for c in columnas]
+        arbol = ttk.Treeview(marco, columns=ids, show="headings",
+                             style="Pruebas.Treeview", selectmode="browse")
+        for clave, titulo, ancho in columnas:
+            arbol.heading(clave, text=titulo, anchor="center")
+            arbol.column(clave, width=ancho, minwidth=48, anchor="center",
+                         stretch=True)
+        arbol.tag_configure("par", background=SURFACE, foreground=TEXT)
+        arbol.tag_configure("impar", background=BG, foreground=TEXT)
+        arbol.tag_configure("fuera", background=BG, foreground=TEXTDIM)
+        arbol.bind("<ButtonRelease-1>", self._clic_incluir)
+        sy = tk.Scrollbar(marco, orient="vertical", command=arbol.yview,
+                          bg=SURFACE, troughcolor=BG)
+        sx = tk.Scrollbar(marco, orient="horizontal", command=arbol.xview,
+                          bg=SURFACE, troughcolor=BG)
+        arbol.configure(yscrollcommand=sy.set, xscrollcommand=sx.set)
+        sy.pack(side="right", fill="y")
+        sx.pack(side="bottom", fill="x")
+        arbol.pack(side="left", fill="both", expand=True)
+        self._arbol_pruebas = arbol
+
+        caja = tk.Frame(win, bg=CARD2)
+        caja.pack(fill="x", padx=14, pady=(0, 8))
+        self._lbl_titulo_prom = tk.Label(
+            caja, text="Promedio", font=(FF, FS, "bold"),
+            bg=CARD2, fg=WARN)
+        self._lbl_titulo_prom.grid(row=0, column=0, columnspan=10,
+                                   sticky="w", padx=10, pady=(6, 0))
+        titulos_prom = (
+            "Kp", "Ki", "Kd", "Pos. inicial", "Ref. final",
+            "Pos. final", "Error", "ts", "te", "Mp",
+        )
+        self._lbls_prom = []
+        for i, titulo in enumerate(titulos_prom):
+            caja.columnconfigure(i, weight=1)
+            tk.Label(caja, text=titulo, font=(FF, FS - 2),
+                     bg=CARD2, fg=TEXTDIM).grid(row=1, column=i, pady=(2, 0))
+            val = tk.Label(caja, text="—", font=(FF, FS, "bold"),
+                           bg=CARD2, fg=WARN)
+            val.grid(row=2, column=i, pady=(0, 8))
+            self._lbls_prom.append(val)
+
+        barra = tk.Frame(win, bg=BG)
+        barra.pack(fill="x", padx=14, pady=(0, 12))
+        self._lbl_n_pruebas = tk.Label(
+            barra, text="", font=(FF, FS), bg=BG, fg=TEXTDIM)
+        self._lbl_n_pruebas.pack(side="left")
+        FlatButton(barra, "Exportar CSV", command=self._exportar_pruebas,
+                   bg_color=ACCENT2, fg_color=TEXT,
+                   width=140, height=32).pack(side="right", padx=(8, 0))
+        FlatButton(barra, "Ninguna", command=lambda: self._marcar_promedio(False),
+                   bg_color=BORDER, fg_color=TEXT,
+                   width=100, height=32).pack(side="right", padx=(8, 0))
+        FlatButton(barra, "Todas", command=lambda: self._marcar_promedio(True),
+                   bg_color=BORDER, fg_color=TEXT,
+                   width=100, height=32).pack(side="right", padx=(8, 0))
+        FlatButton(barra, "Borrar última", command=self._borrar_ultima_prueba,
+                   bg_color=BORDER, fg_color=TEXT,
+                   width=130, height=32).pack(side="right", padx=(8, 0))
+        FlatButton(barra, "Vaciar", command=self._vaciar_pruebas,
+                   bg_color=DANGER, fg_color=TEXT,
+                   width=100, height=32).pack(side="right")
+        self._refrescar_tabla()
+
+    def _elegidas(self):
+        return [p for p in self._pruebas if p.get("en_promedio", True)]
+
+    def _media_pruebas(self):
+        elegidas = self._elegidas()
+        if not elegidas:
+            return None
+        claves = ("kp", "ki", "kd", "pos_in", "ref_fin", "pos_fin",
+                  "error", "ts", "te", "mp")
+        media = {}
+        for clave in claves:
+            vals = [p[clave] for p in elegidas if p[clave] is not None]
+            media[clave] = sum(vals) / len(vals) if vals else None
+        return media
+
+    def _valores_fila(self, i, p):
+        texto = self._texto_prueba(i, p)
+        marca = "Sí" if p.get("en_promedio", True) else "No"
+        return (marca,) + texto
+
+    def _clic_incluir(self, event):
+        arbol = self._arbol_pruebas
+        if arbol.identify_region(event.x, event.y) != "cell":
+            return
+        if arbol.identify_column(event.x) != "#1":
+            return
+        fila = arbol.identify_row(event.y)
+        if not fila:
+            return
+        idx = int(fila) - 1
+        if idx < 0 or idx >= len(self._pruebas):
+            return
+        self._pruebas[idx]["en_promedio"] = not self._pruebas[idx].get(
+            "en_promedio", True)
+        self._refrescar_tabla()
+        if arbol.exists(fila):
+            arbol.selection_set(fila)
+            arbol.focus(fila)
+
+    def _marcar_promedio(self, incluir):
+        if not self._pruebas:
+            return
+        for p in self._pruebas:
+            p["en_promedio"] = incluir
+        self._refrescar_tabla()
+
+    def _refrescar_tabla(self, ir_al_final=False):
+        win = self._ventana_pruebas
+        arbol = self._arbol_pruebas
+        if win is None or arbol is None or not win.winfo_exists():
+            return
+        vista = arbol.yview()
+        arbol.delete(*arbol.get_children())
+        for i, p in enumerate(self._pruebas, start=1):
+            if p.get("en_promedio", True):
+                tag = "par" if i % 2 == 0 else "impar"
+            else:
+                tag = "fuera"
+            arbol.insert("", "end", iid=str(i),
+                         values=self._valores_fila(i, p), tags=(tag,))
+        hijos = arbol.get_children()
+        if hijos and ir_al_final:
+            arbol.see(hijos[-1])
+        elif hijos:
+            arbol.yview_moveto(vista[0])
+        n_sel = len(self._elegidas())
+        self._lbl_n_pruebas.config(
+            text=f"{n_sel} de {len(self._pruebas)} en el promedio")
+        self._lbl_titulo_prom.config(
+            text=f"Promedio ({n_sel} de {len(self._pruebas)})")
+        media = self._media_pruebas()
+        if media is None:
+            textos = ("—",) * 10
+        else:
+            textos = self._texto_prueba("Prom.", media)[1:]
+        for lbl, texto in zip(self._lbls_prom, textos):
+            lbl.config(text=texto)
+
+    def _borrar_ultima_prueba(self):
+        if not self._pruebas:
+            return
+        self._pruebas.pop()
+        self._refrescar_tabla()
+
+    def _vaciar_pruebas(self):
+        if not self._pruebas:
+            return
+        if not messagebox.askyesno(
+                "Vaciar tabla", "¿Borrar todas las pruebas anotadas?",
+                parent=self._ventana_pruebas):
+            return
+        self._pruebas.clear()
+        self._refrescar_tabla()
+
+    def _exportar_pruebas(self):
+        if not self._pruebas:
+            messagebox.showinfo(
+                "Sin pruebas", "Todavía no hay una prueba anotada.",
+                parent=self._ventana_pruebas)
+            return
+        ruta = filedialog.asksaveasfilename(
+            parent=self._ventana_pruebas,
+            title="Exportar pruebas",
+            defaultextension=".csv",
+            filetypes=(("CSV", "*.csv"),),
+            initialfile="pruebas_guia_lineal.csv")
+        if not ruta:
+            return
+        titulos = (
+            "Incluir", "N°", "Kp", "Ki", "Kd",
+            "Pos inicial (mm)", "Ref final (mm)", "Pos final (mm)",
+            "Error (mm)", "ts (s)", "te (s)", "Mp (%)",
+        )
+
+        def celdas_csv(valores):
+            return ["" if c == "—" else c.replace(".", ",") for c in valores]
+
+        try:
+            with open(ruta, "w", newline="", encoding="utf-8-sig") as f:
+                out = csv.writer(f, delimiter=";")
+                out.writerow(titulos)
+                for i, p in enumerate(self._pruebas, start=1):
+                    out.writerow(celdas_csv(self._valores_fila(i, p)))
+                media = self._media_pruebas()
+                if media is not None:
+                    nums = self._texto_prueba("Promedio", media)
+                    out.writerow(celdas_csv(("",) + nums))
+        except OSError as exc:
+            messagebox.showerror(
+                "No se pudo guardar", str(exc), parent=self._ventana_pruebas)
+            return
+        self._log_add("ok", f"CSV guardado: {ruta}")
 
     def _log_add(self, tag, msg):
         ts = time.strftime("%H:%M:%S")
