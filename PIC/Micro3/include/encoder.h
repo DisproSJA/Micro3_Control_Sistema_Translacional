@@ -3,10 +3,11 @@
 
 #include <stdint.h>
 
-/* Cuadratura x2 sobre RC3. RC6 solo dice el sentido. */
+/* Cuadratura x2 por hardware: Timer1, Timer5 y CLC1. A en RC7, B en RB7. */
 
 void Encoder_Iniciar(void);
-void Encoder_ISR(void);
+void Encoder_FijarCero(void);
+uint8_t Encoder_Ab(void);
 int32_t Encoder_Cuentas(void);
 int32_t Encoder_Posicion(void);
 

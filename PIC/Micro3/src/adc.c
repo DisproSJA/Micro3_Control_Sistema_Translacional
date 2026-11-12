@@ -2,32 +2,27 @@
 #include "adc.h"
 
 static volatile uint16_t lectura_adc;
+static uint32_t acum_adc;
 
-/* RA2, 12 bits a la derecha, reloj FRC, referencia 2.048 V. */
+/* RA2, 12 bits a la derecha, reloj FRC, referencia VDD.
+   El pot de 10k va de 0 a 5 V: un tope, la mitad y el otro tope. */
 void Adc_Iniciar(void)
 {
-    uint16_t espera;
-
-    FVRCONbits.ADFVR = 0b10;
-    FVRCONbits.FVREN = 1;
-    espera = 0;
-    while (!FVRCONbits.FVRRDY && (espera < 40000U)) {
-        espera++;
-    }
-
-    /* ADPREF = FVR, ADNREF = VSS. */
-    ADREF = 0x03;
+    /* ADPREF = VDD, ADNREF = VSS. Toda la vuelta entra en 0..4095. */
+    ADREF = 0x00;
     ADPCH = 0x02;
     ADACT = 0x00;
     ADCON1 = 0x00;
     ADCON2 = 0x00;
     ADCON3 = 0x00;
+    ADACQ = 32;                   /* el cursor es de 10k, hay que esperar */
     ADCON0bits.FM = 1;
     ADCON0bits.CS = 1;
     ADCON0bits.CONT = 0;
     ADCON0bits.ON = 1;
 
     lectura_adc = 2048;
+    acum_adc = 2048UL * 8UL;
     PIR1bits.ADIF = 0;
 }
 
@@ -58,4 +53,18 @@ uint16_t Adc_Ver(void)
     lectura = lectura_adc;
     INTCONbits.GIE = gie;
     return lectura;
+}
+
+/* Promedio corto para que el ruido de 5 V no mueva la consigna. */
+uint16_t Adc_Filtrar(void)
+{
+    uint16_t lectura;
+
+    lectura = Adc_Ver();
+    if (lectura > 4095U) {
+        lectura = 4095U;
+    }
+    acum_adc -= acum_adc >> 3;
+    acum_adc += lectura;
+    return (uint16_t)(acum_adc >> 3);
 }

@@ -24,7 +24,7 @@ La meta del lazo es seguir una consigna y, en un escalón de 0 a 50 mm, quedarse
 
 Se abre la carpeta `PIC/Micro3` con la extensión MPLAB. Dispositivo PIC16F18446, compilador XC8 v4.00, programador SNAP. Para compilar: **Ctrl + Shift + P** y `MPLAB CMake: Build`.
 
-El oscilador es el interno a 32 MHz. Hay una sola interrupción. Atiende, en este orden, el encoder, el Timer0, la UART y el ADC. El `main` solo mira banderas y corre un paso del lazo cuando el timer marca muestra.
+El oscilador es el interno a 32 MHz. Hay una sola interrupción. Atiende, en este orden, el Timer0, la UART y el ADC. El encoder no interrumpe: lo cuentan Timer1 y Timer5 por hardware. El `main` solo mira banderas y corre un paso del lazo cuando el timer marca muestra.
 
 
 | Archivo                | Qué hace                                        |
@@ -34,7 +34,7 @@ El oscilador es el interno a 32 MHz. Hay una sola interrupción. Atiende, en est
 | `pines.c`              | Reloj, GPIO y PPS                               |
 | `interrupciones.c`     | La ISR única                                    |
 | `temporizador.c`       | Timer0, periodo 6.667 ms                        |
-| `encoder.c`            | Cuadratura x2 en RC3. RC6 solo dice el sentido  |
+| `encoder.c`            | Cuadratura x2 con Timer1, Timer5 y la CLC1      |
 | `adc.c`                | Potenciómetro en RA2, referencia 2.048 V        |
 | `drv8871_pwm.c`        | PWM a 31.25 kHz hacia el DRV8871                |
 | `control_pid.c`        | PID en enteros                                  |
@@ -49,10 +49,10 @@ Pines que sí se usan:
 
 | Señal           | Pin            |
 | --------------- | -------------- |
-| IN1 del DRV8871 | RC2, PWM6      |
-| IN2 del DRV8871 | RC1, PWM7      |
-| Encoder A       | RC3            |
-| Encoder B       | RC6            |
+| IN1 del DRV8871 | RC0, PWM6      |
+| IN2 del DRV8871 | RA5, PWM7      |
+| Encoder A       | RC7 (sensor 2) |
+| Encoder B       | RB7 (sensor 2) |
 | Potenciómetro   | RA2            |
 | TX / RX         | RC4 / RC5      |
 | ICSP            | RA0, RA1, MCLR |
@@ -64,21 +64,15 @@ El PWM usa decaimiento lento: el tiempo en alto frena y el tiempo en bajo mueve.
 
 600 PPR y solo los flancos de A dan 1200 cuentas por vuelta. Con 8 mm de avance son 150 cuentas por milímetro.
 
-El conteo vive en RAM. Cada vez que el PIC se enciende o se graba, arranca en 0, en el sitio donde esté el carro. Por eso el 0 mm físico se fija así:
+El conteo es por hardware. Timer1 cuenta las subidas de A con B en bajo y Timer5 las bajadas; la CLC1 le entrega A negada porque los timers solo cuentan subidas. El signo es el del contador que se usó en la ESP: con B en bajo, la subida resta y la bajada suma. El nivel de A completa la cuenta que cae con B en alto, y quedan 1200 cuentas por vuelta. B entra por RB7.
 
-1. Con todo apagado, deja el carro en el 0 mm real.
-2. Enciende o graba el PIC sin moverlo.
-3. Deja `CUENTAS_HOME` en 0, en `include/configuracion.h`.
-4. `C` tiene que responder `ENC:0`.
-5. `Z` mueve el carro hasta ese conteo y, al llegar a 0.1 mm, lo toma como home.
+`Z` no mueve el carro. Con el motor suelto y el encoder quieto 300 ms, toma el conteo de ese instante como 0 mm. Después `P` manda la consigna respecto a ese cero. Si `P` se aleja del punto pedido, cambia `INVERTIR_GIRO` a 1 en `configuracion.h` y graba otra vez. `INVERTIR_ENCODER` invierte el signo de las cuentas.
 
-Quitar solo los 24 V del motor no borra el conteo: el PIC sigue alimentado. Si `Z` se aleja del cero, cambia `INVERTIR_GIRO` a 1 y vuelve a grabar. `INVERTIR_ENCODER` invierte el signo de las cuentas.
-
-La posición que viaja por la telemetría y entra al PID es el conteo actual menos `CUENTAS_HOME`.
+La posición que viaja por la telemetría y entra al PID es el conteo actual menos el cero que fijó `Z`.
 
 ### PID
 
-Es el de la simulación, sin `float`. La parte integral va por Tustin y la derivada por Euler hacia atrás, sobre la medición. N queda fijo. La salida se satura en ±24 V y, si satura, el integrador no sigue creciendo.
+Es el de la simulación, sin `float`. La parte integral va por Tustin y la derivada por Euler hacia atrás, sobre la medición. N queda fijo. La fuente es de 24 V y el PWM se calcula sobre esos 24 V. La salida del PID se satura en ±8 V (`VLIM_MV`), el límite con el que se probó el control. Si satura, el integrador no sigue creciendo.
 
 Valores iniciales: Kp = 1.5 V/mm, Ki = 0, Kd = 0.07. Ki arranca en 0 porque el modelo no trae la fricción de la guía; se puede subir en caliente con `Ki:`.
 
@@ -90,17 +84,20 @@ UART a 115200 8N1. Cada comando termina en Enter. Al arrancar el PIC manda `RDY`
 | Comando   | Qué hace                                                    |
 | --------- | ----------------------------------------------------------- |
 | `C`       | Responde `ENC:` y el conteo crudo                           |
-| `Z`       | Busca `CUENTAS_HOME`. Responde `OK` y, al llegar, `OK HOME` |
+| `Z`       | La posición actual pasa a ser 0 mm. No mueve el motor       |
 | `P50.0`   | Consigna digital, de −100.0 a 100.0 mm, resolución 0.1 mm   |
 | `S`       | Suelta el motor y borra el estado del PID                   |
+| `X`       | Borra una falla. Después hay que mandar `Z` otra vez       |
 | `D`       | Vuelve a la última consigna digital                         |
 | `A`       | La consigna pasa al potenciómetro. 1.024 V es 0 mm          |
 | `Kp:1.5`  | Proporcional, de 0 a 20                                     |
 | `Ki:0`    | Integral, de 0 a 20                                         |
-| `Kd:0.07` | Derivativa, de 0 a 2                                        |
+| `Kd:0.07`  | Derivativa, de 0 a 2                                       |
 
 
-`P`, `D` y `A` responden `ERR HOME` hasta que un `Z` haya terminado bien. Si la búsqueda no llega en 8 s, también responde `ERR HOME` y suelta el motor. Un número mal escrito o fuera de rango responde `ERR VALOR` o `ERR RANGO`.
+`P`, `D` y `A` responden `ERR HOME` hasta que un `Z` haya fijado el cero. `Z` con el motor en marcha responde `ERR PARADO`, y si el encoder se movió en los últimos 300 ms responde `ERR QUIETO`. Un número mal escrito o fuera de rango responde `ERR VALOR` o `ERR RANGO`.
+
+El lazo frena el motor y responde `ERR FALLO` si el carro pasa de ±102 mm, si empuja contra el borde, si el encoder salta más de lo que permiten 4000 rpm, o si hay más de 3 V y más de 1 mm de error sin moverse durante 450 ms. Después de una falla hay que mandar `X` y otra vez `Z`. En la interfaz, PARAR manda `X` cuando hay una falla.
 
 Cada muestra, si hay espacio en el buffer de TX, sale:
 

@@ -70,10 +70,11 @@ static uint8_t poner_voltios(char *buf, uint8_t n, int16_t milivoltios)
     return n;
 }
 
-/* consigna, posicion, error, salida. Si no cabe en el buffer, se salta. */
-void Telemetria_Enviar(int32_t consigna, int32_t posicion, int16_t milivoltios)
+/* consigna, posicion, error, salida, ADC. Si no cabe, se salta. */
+void Telemetria_Enviar(int32_t consigna, int32_t posicion, int16_t milivoltios,
+                       uint16_t adc)
 {
-    char buf[44];
+    char buf[48];
     uint8_t n;
     uint8_t i;
 
@@ -85,10 +86,12 @@ void Telemetria_Enviar(int32_t consigna, int32_t posicion, int16_t milivoltios)
     n = poner_mm(buf, n, consigna - posicion);
     n = poner_char(buf, n, ',');
     n = poner_voltios(buf, n, milivoltios);
+    n = poner_char(buf, n, ',');
+    n = poner_u16(buf, n, adc);
     n = poner_char(buf, n, '\r');
     n = poner_char(buf, n, '\n');
-    if (n > 43U) {
-        n = 43U;
+    if (n > 47U) {
+        n = 47U;
     }
     buf[n] = '\0';
 

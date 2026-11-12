@@ -37,13 +37,6 @@ except ImportError:
     print("[AVISO] pyserial no instalado  →  pip install pyserial")
 
 try:
-    import pyvisa
-    HAS_VISA = True
-except ImportError:
-    HAS_VISA = False
-    print("[AVISO] pyvisa no instalado    →  pip install pyvisa pyvisa-py")
-
-try:
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
     HAS_MPL = True
@@ -77,17 +70,23 @@ BAUD_RATE  = 115200
 FS_HZ      = 150
 VENTANA_S  = 10
 MAX_PUNTOS = FS_HZ * 30
-LEFT_W     = 330
-POS_MIN    = -100.0
-POS_MAX    = 100.0
+LEFT_W     = 400
+# Escalón: ts va del 10 % al 90 %. te es la entrada a la banda del 2 %.
+# La ventana se corta en 3*te para que el escalón quede quieto y con zoom.
+BANDA_TE   = 0.02
+VENTANA_TE = 3.0
+PASO_MIN   = 1.0
+POS_MIN    = -120.0
+POS_MAX    = 120.0
 
 UI_SCALE = 1.0
 
-# Cada muestra: consigna, posicion, error (1 decimal) y voltios (2).
+# Cada muestra: consigna, posicion, error (1 decimal), voltios (2) y el ADC.
 TELEMETRIA_RE = re.compile(
-    r"^([+-]?\d+\.\d),([+-]?\d+\.\d),([+-]?\d+\.\d),([+-]?\d+\.\d{2})$")
-# C responde el conteo crudo, el que se pega en CUENTAS_HOME.
+    r"^([+-]?\d+\.\d),([+-]?\d+\.\d),([+-]?\d+\.\d),([+-]?\d+\.\d{2}),(\d+)$")
+# C responde el conteo crudo y, en otra linea, A y B como los ve el PIC.
 ENC_RE = re.compile(r"^ENC:(-?\d+)$")
+AB_RE = re.compile(r"^AB:([01])([01])$")
 NUMERO_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?$")
 
 
@@ -195,7 +194,7 @@ def entry_row(parent, label_text, var, cmd, hint_color=ACCENT, w_label=12):
 
 
 class Riel(tk.Canvas):
-    """Regla de -100 a 100 mm. Naranja es la referencia, cian es el carro."""
+    """Regla de -120 a 120 mm. Naranja es la referencia, cian es el carro."""
 
     def __init__(self, parent):
         super().__init__(parent, bg=BG, height=px(78),
@@ -226,8 +225,8 @@ class Riel(tk.Canvas):
         y = 28
 
         self.create_line(x0, y, x1, y, fill=BORDER, width=3)
-        for mm, txt in ((-100, "-100"), (-50, "-50"), (0, "0"),
-                        (50, "50"), (100, "100")):
+        for mm, txt in ((-120, "-120"), (-60, "-60"), (0, "0"),
+                        (60, "60"), (120, "120")):
             x = self._x(mm, x0, ancho)
             self.create_line(x, y - 6, x, y + 6, fill=TEXTDIM)
             self.create_text(x, y + 16, text=txt, fill=TEXTDIM,
@@ -384,10 +383,20 @@ class MainFrame(tk.Frame):
         self._y_ref    = deque(maxlen=MAX_PUNTOS)
         self._y_pos    = deque(maxlen=MAX_PUNTOS)
         self._t0       = None
-        self._visa_inst = None
         self._muestra  = None
         self._graficar = False
         self._buscando_home = False
+        self._en_fallo = False
+        self._paso_t = []
+        self._paso_y = []
+        self._paso_t0 = None
+        self._paso_y0 = 0.0
+        self._paso_yf = 0.0
+        self._paso_activo = False
+        self._paso_fijo = False
+        self._paso_dibujar = False
+        self._marca_ts = None
+        self._marca_te = None
 
         self._build()
         self._refresh_ports()
@@ -448,10 +457,10 @@ class MainFrame(tk.Frame):
         left.columnconfigure(0, weight=1)
         left.rowconfigure(0, weight=5)
         left.rowconfigure(1, weight=3)
-        left.rowconfigure(2, weight=4)
+        left.rowconfigure(2, weight=3, minsize=px(160))
         self._card_control(left)
         self._card_lectura(left)
-        self._card_fuente(left)
+        self._build_log(left)
 
     def _big_button(self, parent, text, cmd, color):
         FlatButton(parent, text, command=cmd,
@@ -468,19 +477,25 @@ class MainFrame(tk.Frame):
         self._big_button(card, "IR AL HOME   (Z)",
                          self._send_z, ACCENT)
         self._big_button(card, "PARAR   (S)",
-                         lambda: self._enviar_simple("S", "Parado"), DANGER)
+                         self._parar, DANGER)
 
         fila = tk.Frame(card, bg=CARD2)
         fila.pack(fill="x", padx=14, pady=3)
         fila.columnconfigure(0, weight=1, uniform="m")
         fila.columnconfigure(1, weight=1, uniform="m")
-        FlatButton(fila, "DIGITAL  (D)",
-                   command=lambda: self._enviar_simple("D", "Digital"),
-                   bg_color=BORDER, fg_color=TEXT,
-                   width=1, height=34, font_size=FS).grid(
-                       row=0, column=0, sticky="ew", padx=(0, 4))
+        pot = tk.Frame(fila, bg=SURFACE, height=px(34))
+        pot.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        pot.pack_propagate(False)
+        tk.Label(pot, text="ADC", font=(FF, FS - 2, "bold"),
+                 bg=SURFACE, fg=TEXTDIM).pack(side="left", padx=(8, 4))
+        self._lbl_pot_adc = tk.Label(
+            pot, text="—", font=(FF, FS, "bold"), bg=SURFACE, fg=WARN)
+        self._lbl_pot_adc.pack(side="left")
+        self._lbl_pot_mm = tk.Label(
+            pot, text="—", font=(FF, FS, "bold"), bg=SURFACE, fg=ORANGE)
+        self._lbl_pot_mm.pack(side="right", padx=(4, 8))
         FlatButton(fila, "ANALÓGICA  (A)",
-                   command=lambda: self._enviar_simple("A", "Analógica"),
+                   command=self._send_analog,
                    bg_color=BORDER, fg_color=TEXT,
                    width=1, height=34, font_size=FS).grid(
                        row=0, column=1, sticky="ew", padx=(4, 0))
@@ -502,6 +517,15 @@ class MainFrame(tk.Frame):
         entry_row(card, "Kd:", self._kd_var,
                   lambda: self._send_ganancia("Kd", self._kd_var, 2.0),
                   hint_color=PURPLE)
+
+        self._lim_min_var = tk.StringVar(value="-120.0")
+        self._lim_max_var = tk.StringVar(value="120.0")
+        self._lim_min = -120.0
+        self._lim_max = 120.0
+        entry_row(card, "Mín (mm):", self._lim_min_var, self._send_limites,
+                  hint_color=WARN)
+        entry_row(card, "Máx (mm):", self._lim_max_var, self._send_limites,
+                  hint_color=WARN)
 
         self._reset_var = tk.BooleanVar(value=True)
         tk.Checkbutton(
@@ -537,75 +561,41 @@ class MainFrame(tk.Frame):
             lbl.pack(expand=True, anchor="n")
             setattr(self, attr, lbl)
 
+        fila = tk.Frame(card, bg=CARD2)
+        fila.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
+        for col in range(3):
+            fila.columnconfigure(col, weight=1)
+        for col, titulo, attr, color in (
+            (0, "ts", "_lbl_ts", WARN),
+            (1, "te", "_lbl_te", TEXT),
+            (2, "Mp", "_lbl_mp", DANGER),
+        ):
+            cell = tk.Frame(fila, bg=CARD2)
+            cell.grid(row=0, column=col, sticky="nsew")
+            tk.Label(cell, text=titulo, font=(FF, FS - 2, "bold"),
+                     bg=CARD2, fg=TEXTDIM).pack(anchor="s")
+            lbl = tk.Label(cell, text="—", font=(FF, FS, "bold"),
+                           bg=CARD2, fg=color)
+            lbl.pack(anchor="n")
+            setattr(self, attr, lbl)
+
         self._lbl_modo = tk.Label(
-            card, text="Modo: sin home",
+            card, text="Modo: en el home",
             font=(FF, FS - 1), bg=CARD2, fg=TEXTDIM)
-        self._lbl_modo.grid(row=2, column=0, columnspan=2, pady=(4, 0))
+        self._lbl_modo.grid(row=3, column=0, columnspan=2, pady=(4, 0))
         self._lbl_enc = tk.Label(
             card, text="Encoder: —",
             font=(FF, FS, "bold"), bg=CARD2, fg=ORANGE)
-        self._lbl_enc.grid(row=3, column=0, columnspan=2, pady=(0, 6))
-
-    def _card_fuente(self, parent):
-        wrap, card = card_frame(parent, "Fuente de poder", WARN)
-        wrap.grid(row=2, column=0, sticky="nsew")
-
-        row0 = tk.Frame(card, bg=CARD2)
-        row0.pack(fill="x", expand=True, padx=14, pady=3)
-        tk.Label(row0, text="VISA:", font=(FF, FS),
-                 bg=CARD2, fg=TEXTDIM, width=12,
-                 anchor="w").pack(side="left")
-        FlatButton(row0, "Buscar", command=self._scan_visa,
-                   bg_color=BORDER, fg_color=TEXT,
-                   width=64, height=30, font_size=FS - 1).pack(side="right")
-        self._visa_var = tk.StringVar()
-        self._visa_cb = ttk.Combobox(
-            row0, textvariable=self._visa_var, font=(FF, FS))
-        self._visa_cb.pack(side="left", fill="x", expand=True, padx=6)
-
-        self._volt_var = tk.StringVar(value="24.0")
-        self._curr_var = tk.StringVar(value="2.0")
-        self._visa_entry(card, "Voltaje (V):", self._volt_var)
-        self._visa_entry(card, "Corriente (A):", self._curr_var)
-
-        sep_h(card, pady=6)
-        self._big_button(card, "CONECTAR FUENTE", self._connect_visa, BORDER)
-
-        row_b = tk.Frame(card, bg=CARD2)
-        row_b.pack(fill="x", expand=True, padx=14, pady=(4, 8))
-        row_b.columnconfigure(0, weight=1, uniform="b")
-        row_b.columnconfigure(1, weight=1, uniform="b")
-        FlatButton(row_b, "ENCENDER", command=self._power_on,
-                   bg_color=ACCENT2, fg_color=TEXT,
-                   width=1, height=36, font_size=FS).grid(
-                       row=0, column=0, sticky="ew", padx=(0, 4))
-        FlatButton(row_b, "APAGAR", command=self._power_off,
-                   bg_color=DANGER, fg_color=TEXT,
-                   width=1, height=36, font_size=FS).grid(
-                       row=0, column=1, sticky="ew", padx=(4, 0))
-
-    def _visa_entry(self, parent, label, var):
-        row = tk.Frame(parent, bg=CARD2)
-        row.pack(fill="x", expand=True, padx=14, pady=3)
-        tk.Label(row, text=label, font=(FF, FS),
-                 bg=CARD2, fg=TEXTDIM, width=12,
-                 anchor="w").pack(side="left")
-        tk.Entry(row, textvariable=var,
-                 font=(FF, FS + 1), bg=SURFACE, fg=TEXT,
-                 insertbackground=WARN, relief="flat",
-                 bd=0, highlightthickness=1,
-                 highlightcolor=WARN,
-                 highlightbackground=BORDER).pack(
-                     side="left", fill="x", expand=True, padx=6, ipady=4)
+        self._lbl_enc.grid(row=4, column=0, columnspan=2, pady=(0, 6))
 
     def _build_right(self, parent):
         right = tk.Frame(parent, bg=BG)
         right.grid(row=0, column=1, sticky="nsew")
         right.rowconfigure(0, weight=3)
-        right.rowconfigure(1, weight=2)
+        right.rowconfigure(1, weight=3)
         right.columnconfigure(0, weight=1)
         self._build_graph(right)
-        self._build_log(right)
+        self._build_escalon(right)
 
     def _build_graph(self, parent):
         wrap, body = card_frame(parent, "Posición en el tiempo", CYAN)
@@ -637,7 +627,7 @@ class MainFrame(tk.Frame):
         self._ax.set_xlabel("Tiempo (s)", color=TEXTDIM, fontsize=8)
         self._ax.set_ylabel("Posición (mm)", color=TEXTDIM, fontsize=8)
         self._ax.set_xlim(0, VENTANA_S)
-        self._ax.set_ylim(-110, 110)
+        self._ax.set_ylim(-130, 130)
         self._ax.grid(True, color=BORDER, linewidth=0.6)
         self._line_ref, = self._ax.plot(
             [], [], color=ORANGE, linewidth=1.6, linestyle="--",
@@ -653,9 +643,31 @@ class MainFrame(tk.Frame):
         self._mpl.get_tk_widget().pack(fill="both", expand=True,
                                        padx=4, pady=4)
 
+    def _build_escalon(self, parent):
+        wrap, body = card_frame(parent, "Escalón", WARN)
+        wrap.grid(row=1, column=0, sticky="nsew")
+
+        tk.Label(body,
+                 text="ts: 10 % a 90 %      te: se queda dentro del 2 %      Mp: sobrepaso",
+                 font=(FF, FS - 1), bg=CARD2, fg=TEXTDIM).pack(
+                     anchor="w", padx=10, pady=(4, 0))
+
+        if not HAS_MPL:
+            tk.Label(body, text="matplotlib no instalado",
+                     bg=CARD2, fg=DANGER, font=(FF, FS)).pack(expand=True)
+            self._ax2 = None
+            return
+
+        self._fig2 = Figure(figsize=(6, 2.6), dpi=96, facecolor=BG)
+        self._ax2 = self._fig2.add_subplot(111)
+        self._mpl2 = FigureCanvasTkAgg(self._fig2, master=body)
+        self._mpl2.get_tk_widget().pack(fill="both", expand=True,
+                                        padx=4, pady=4)
+        self._pintar_escalon()
+
     def _build_log(self, parent):
         wrap, body = card_frame(parent, "Terminal", ACCENT)
-        wrap.grid(row=1, column=0, sticky="nsew")
+        wrap.grid(row=2, column=0, sticky="nsew")
 
         inner = tk.Frame(body, bg=CARD2)
         inner.pack(fill="both", expand=True, padx=4, pady=(2, 6))
@@ -663,7 +675,7 @@ class MainFrame(tk.Frame):
         self._log = tk.Text(
             inner, bg=BG, fg=TEXTLOG,
             font=("Consolas", 9), relief="flat",
-            wrap="word", state="disabled",
+            height=9, wrap="word", state="disabled",
             selectbackground=ACCENT, insertbackground=ACCENT)
         sb = tk.Scrollbar(inner, orient="vertical",
                           command=self._log.yview,
@@ -730,9 +742,27 @@ class MainFrame(tk.Frame):
         if self._send(cmd) and modo:
             self._lbl_modo.config(text=f"Modo: {modo}")
 
+    def _parar(self):
+        self._enviar_simple("S", "Parado")
+
+    def _send_analog(self):
+        self._paso_t = []
+        self._paso_y = []
+        self._paso_activo = False
+        self._paso_fijo = False
+        self._paso_dibujar = True
+        self._marca_ts = None
+        self._marca_te = None
+        self._lbl_ts.config(text="—")
+        self._lbl_te.config(text="—")
+        self._lbl_mp.config(text="—")
+        self._enviar_simple("A", "analógica")
+
     def _send_z(self):
-        self._buscando_home = True
-        self._enviar_simple("Z", "Buscando home")
+        if self._reset_var.get():
+            self._limpiar_grafica()
+        self._nuevo_escalon(0.0)
+        self._enviar_simple("Z", "home")
 
     def _leer_numero(self, texto):
         t = texto.strip().replace(",", ".")
@@ -747,12 +777,32 @@ class MainFrame(tk.Frame):
             return
         _, valor = parsed
         if valor < POS_MIN or valor > POS_MAX:
-            self._log_add("err", "La posición va de -100.0 a 100.0 mm")
+            self._log_add("err", "La posición va de -120.0 a 120.0 mm")
+            return
+        if valor < self._lim_min or valor > self._lim_max:
+            self._log_add("err", "Esa posición está fuera de los finales de carrera")
             return
         if self._reset_var.get():
             self._limpiar_grafica()
+        self._nuevo_escalon(valor)
         if self._send(f"P{valor:.1f}"):
             self._lbl_modo.config(text="Modo: digital")
+
+    def _send_limites(self):
+        a = self._leer_numero(self._lim_min_var.get())
+        b = self._leer_numero(self._lim_max_var.get())
+        if a is None or b is None:
+            self._log_add("err", "Los finales de carrera tienen que ser números")
+            return
+        lo = a[1]
+        hi = b[1]
+        if lo < POS_MIN or hi > POS_MAX or lo >= hi:
+            self._log_add("err", "El mínimo va de -120 hasta antes del máximo, y el máximo hasta 120")
+            return
+        if self._send(f"F{lo:.1f},{hi:.1f}"):
+            self._lim_min = lo
+            self._lim_max = hi
+            self._log_add("sys", f"Finales de carrera {lo:.1f} a {hi:.1f} mm")
 
     def _send_ganancia(self, nombre, var, tope):
         parsed = self._leer_numero(var.get())
@@ -798,6 +848,10 @@ class MainFrame(tk.Frame):
             self._aplicar_lectura()
             self._pintar()
             self._graficar = False
+        if self._paso_dibujar:
+            self._evaluar_escalon()
+            self._pintar_escalon()
+            self._paso_dibujar = False
         self.after(50, self._poll)
 
     def _handle_msg(self, msg):
@@ -814,12 +868,24 @@ class MainFrame(tk.Frame):
             self._y_pos.append(pos)
             self._muestra = (ref, pos, err, vol)
             self._graficar = True
+            adc = int(m.group(5))
+            mm_pot = (adc * 36000 // 4095 - 18000) / 150.0
+            self._lbl_pot_adc.config(text=str(adc))
+            self._lbl_pot_mm.config(text=f"{mm_pot:+.1f} mm")
+            if self._paso_activo and not self._paso_fijo and self._paso_t0 is not None:
+                self._paso_t.append(time.time() - self._paso_t0)
+                self._paso_y.append(pos)
+                self._paso_dibujar = True
             return
 
         m = ENC_RE.match(msg)
         if m:
             self._lbl_enc.config(text=f"Encoder: {m.group(1)}")
-            self._log_add("adc", f"ENC {m.group(1)}    pégalo en CUENTAS_HOME")
+            self._log_add("adc", f"ENC {m.group(1)}")
+            return
+        m = AB_RE.match(msg)
+        if m:
+            self._log_add("adc", f"A={m.group(1)}  B={m.group(2)}")
             return
         if msg == "RDY":
             self._log_add("sys", "PIC listo")
@@ -827,24 +893,37 @@ class MainFrame(tk.Frame):
         if msg == "OK HOME":
             self._buscando_home = False
             self._lbl_modo.config(text="Modo: en el home")
-            self._log_add("ok", "Llegó al conteo del home")
+            self._en_fallo = False
+            self._log_add("ok", "Yendo a la posición de encendido")
             return
         if msg == "ERR HOME":
-            if self._buscando_home:
-                self._lbl_modo.config(text="Modo: no encontró el home")
-                self._log_add("err", "Z no llegó al conteo de CUENTAS_HOME")
-            else:
-                self._lbl_modo.config(text="Modo: sin home")
-                self._log_add("err", "Primero manda Z")
+            self._lbl_modo.config(text="Modo: sin home")
+            self._log_add("err", "El home se fija al encender")
             self._buscando_home = False
             return
         if msg == "ERR RANGO":
             self._log_add("err", "Fuera de rango")
             return
+        if msg == "ERR FALLO":
+            self._buscando_home = False
+            self._en_fallo = True
+            self._lbl_modo.config(text="Modo: falla, motor frenado")
+            self._log_add("err", "Protección: el encoder saltó o el motor no se movió. "
+                                 "Pulsa PARAR para soltar el freno")
+            return
+        if msg == "ERR PARADO":
+            self._buscando_home = False
+            self._log_add("err", "Primero pulsa PARAR y deja el carro quieto")
+            return
+        if msg == "ERR QUIETO":
+            self._buscando_home = False
+            self._log_add("err", "El encoder se está moviendo. Espera y repite Z")
+            return
         if msg == "ERR VALOR":
             self._log_add("err", "El PIC no entendió el comando")
             return
         if msg == "OK":
+            self._en_fallo = False
             self._log_add("ok", "OK")
             return
         if msg.startswith("ERR"):
@@ -896,59 +975,164 @@ class MainFrame(tk.Frame):
         self._ax.set_ylim(y0, y1)
         self._mpl.draw_idle()
 
-    def _scan_visa(self):
-        if not HAS_VISA:
-            messagebox.showwarning("pyvisa", "pip install pyvisa pyvisa-py")
-            return
-        try:
-            rm = pyvisa.ResourceManager()
-            resources = list(rm.list_resources())
-            self._visa_cb["values"] = resources
-            if resources:
-                self._visa_cb.set(resources[0])
-            self._log_add("sys", f"VISA: {len(resources)} recurso(s)")
-        except Exception as exc:
-            self._log_add("err", f"VISA: {exc}")
+    def _nuevo_escalon(self, yf):
+        # Cada P borra el escalón anterior. y0 es donde está el carro ahora.
+        if self._muestra:
+            y0 = self._muestra[1]
+        else:
+            y0 = 0.0
+        self._paso_y0 = y0
+        self._paso_yf = yf
+        self._paso_t = [0.0]
+        self._paso_y = [y0]
+        self._paso_t0 = time.time()
+        self._paso_activo = abs(yf - y0) >= PASO_MIN
+        self._paso_fijo = False
+        self._paso_dibujar = True
+        self._marca_ts = None
+        self._marca_te = None
+        self._lbl_ts.config(text="—")
+        self._lbl_te.config(text="—")
+        self._lbl_mp.config(text="—")
 
-    def _connect_visa(self):
-        if not HAS_VISA:
-            messagebox.showwarning("pyvisa", "pip install pyvisa pyvisa-py")
-            return
-        res = self._visa_var.get().strip()
-        if not res:
-            messagebox.showwarning("VISA", "Escribe o elige el recurso VISA.")
-            return
-        try:
-            rm = pyvisa.ResourceManager()
-            self._visa_inst = rm.open_resource(res)
-            idn = self._visa_inst.query("*IDN?").strip()
-            self._log_add("ok", f"Fuente: {idn}")
-        except Exception as exc:
-            self._log_add("err", f"VISA: {exc}")
+    def _cruce(self, nivel, sube, ultimo=False):
+        ys = self._paso_y
+        ts = self._paso_t
+        hallado = None
+        for i in range(1, len(ys)):
+            a, b = ys[i - 1], ys[i]
+            if b == a:
+                continue
+            if sube and a < nivel <= b:
+                pasa = True
+            elif (not sube) and a > nivel >= b:
+                pasa = True
+            else:
+                pasa = False
+            if pasa:
+                frac = (nivel - a) / (b - a)
+                hallado = ts[i - 1] + frac * (ts[i] - ts[i - 1])
+                if not ultimo:
+                    return hallado
+        return hallado
 
-    def _power_on(self):
-        if not self._visa_inst:
-            self._log_add("err", "Conecta la fuente primero")
+    def _evaluar_escalon(self):
+        if not self._paso_activo or len(self._paso_y) < 2:
             return
-        try:
-            v = float(self._volt_var.get().replace(",", "."))
-            i = float(self._curr_var.get().replace(",", "."))
-            self._visa_inst.write(f"VOLT {v:.3f}")
-            self._visa_inst.write(f"CURR {i:.3f}")
-            self._visa_inst.write("OUTP ON")
-            self._log_add("ok", f"Fuente ON  {v:g} V  /  {i:g} A")
-        except Exception as exc:
-            self._log_add("err", f"VISA: {exc}")
+        y0 = self._paso_y0
+        yf = self._paso_yf
+        amp = yf - y0
+        if abs(amp) < PASO_MIN:
+            return
+        sube = amp > 0
+        banda = BANDA_TE * abs(amp)
 
-    def _power_off(self):
-        if not self._visa_inst:
-            self._log_add("err", "Conecta la fuente primero")
+        t10 = self._cruce(y0 + 0.10 * amp, sube)
+        t90 = self._cruce(y0 + 0.90 * amp, sube)
+        if t10 is not None and t90 is not None and t90 >= t10:
+            # La línea va en el 90 %: ahí ya se obtuvo ts y la señal está cerca.
+            self._marca_ts = t90
+            self._lbl_ts.config(text=f"{t90 - t10:.3f} s")
+            pico = yf - min(self._paso_y) if not sube else max(self._paso_y) - yf
+            self._lbl_mp.config(text=f"{max(0.0, pico) / abs(amp) * 100.0:.1f} %")
+
+        # te es el último cruce del borde del 2 %. Si la cola sigue afuera, no hay te.
+        if abs(self._paso_y[-1] - yf) > banda:
+            self._marca_te = None
+            self._lbl_te.config(text="—")
             return
-        try:
-            self._visa_inst.write("OUTP OFF")
-            self._log_add("sys", "Fuente apagada")
-        except Exception as exc:
-            self._log_add("err", f"VISA: {exc}")
+        borde = (yf - banda) if sube else (yf + banda)
+        te = self._cruce(borde, sube, ultimo=True)
+        # El 2 % está después del 90 %. Si el cruce queda antes, todavía no llegó.
+        if te is None or (t90 is not None and te < t90):
+            self._marca_te = None
+            self._lbl_te.config(text="—")
+            return
+        self._marca_te = te
+        self._lbl_te.config(text=f"{te:.3f} s")
+        if self._paso_t[-1] >= VENTANA_TE * te:
+            self._paso_fijo = True
+            self._paso_activo = False
+
+    def _estilo_escalon(self):
+        ax = self._ax2
+        ax.set_facecolor(BG)
+        ax.tick_params(colors=TEXTDIM, labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_color(BORDER)
+        ax.set_xlabel("Tiempo (s)", color=TEXTDIM, fontsize=8)
+        ax.set_ylabel("Posición (mm)", color=TEXTDIM, fontsize=8)
+        ax.grid(True, color=BORDER, linewidth=0.6)
+
+    def _pintar_escalon(self):
+        if not HAS_MPL or self._ax2 is None:
+            return
+        ax = self._ax2
+        ax.cla()
+        self._estilo_escalon()
+        if len(self._paso_t) < 2:
+            ax.text(0.5, 0.5, "El escalón aparece al mandar P",
+                    transform=ax.transAxes, ha="center", va="center",
+                    color=TEXTDIM, fontsize=9)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            self._fig2.tight_layout(pad=0.6)
+            self._mpl2.draw_idle()
+            return
+
+        y0 = self._paso_y0
+        yf = self._paso_yf
+        amp = yf - y0
+        banda = BANDA_TE * abs(amp)
+        if self._marca_te is not None:
+            t_fin = VENTANA_TE * self._marca_te
+        else:
+            t_fin = max(self._paso_t[-1], 0.4)
+        t_pos = list(self._paso_t)
+        y_pos = list(self._paso_y)
+        if t_fin > t_pos[-1]:
+            t_pos.append(t_fin)
+            y_pos.append(y_pos[-1])
+        ax.plot([0.0, 0.0, t_fin], [y0, yf, yf],
+                color=ORANGE, linewidth=1.4, linestyle="--", label="Referencia")
+        ax.plot(t_pos, y_pos,
+                color=CYAN, linewidth=1.6, label="Posición")
+        if abs(amp) >= PASO_MIN:
+            ax.axhline(yf + banda, color=TEXTDIM, linewidth=0.7, linestyle=":")
+            ax.axhline(yf - banda, color=TEXTDIM, linewidth=0.7, linestyle=":")
+            ax.text(0.98, yf + banda, "±2 %", color=TEXTDIM,
+                    fontsize=7, va="bottom", ha="right",
+                    transform=ax.get_yaxis_transform())
+        if self._marca_ts is not None:
+            ax.axvline(self._marca_ts, color=WARN, linewidth=1.1,
+                       linestyle="--")
+            ax.text(self._marca_ts, 1.0, " ts", color=WARN, fontsize=8,
+                    rotation=90, va="top", ha="right",
+                    transform=ax.get_xaxis_transform())
+        if self._marca_te is not None:
+            ax.axvline(self._marca_te, color=TEXT, linewidth=1.1,
+                       linestyle=":")
+            ax.text(self._marca_te, 1.0, " te", color=TEXT, fontsize=8,
+                    rotation=90, va="top", ha="left",
+                    transform=ax.get_xaxis_transform())
+
+        ys = self._paso_y + [y0, yf]
+        bajo = min(ys) - banda
+        alto = max(ys) + banda
+        if alto - bajo < 4.0:
+            medio = 0.5 * (bajo + alto)
+            bajo, alto = medio - 2.0, medio + 2.0
+        else:
+            holgura = 0.12 * (alto - bajo)
+            bajo -= holgura
+            alto += holgura
+        ax.set_ylim(bajo, alto)
+        ax.set_xlim(0.0, t_fin)
+        leg = ax.legend(loc="upper right", fontsize=8, frameon=False)
+        for txt in leg.get_texts():
+            txt.set_color(TEXTDIM)
+        self._fig2.tight_layout(pad=0.6)
+        self._mpl2.draw_idle()
 
     def _log_add(self, tag, msg):
         ts = time.strftime("%H:%M:%S")

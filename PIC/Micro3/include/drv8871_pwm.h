@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-/* IN1 = PWM6 en RC2, IN2 = PWM7 en RC1. 31.25 kHz. */
+/* IN1 = PWM6 en RC0, IN2 = PWM7 en RA5. 31.25 kHz. */
 
 void Pwm_Iniciar(void);
 void Pwm_AplicarMv(int16_t milivoltios);

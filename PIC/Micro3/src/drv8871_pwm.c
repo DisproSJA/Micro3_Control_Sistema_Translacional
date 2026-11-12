@@ -37,11 +37,14 @@ void Pwm_Iniciar(void)
     T2CONbits.ON = 1;
 }
 
+static int8_t sentido;
+
 /* IN1 e IN2 en bajo: rueda libre. Es el comando S. */
 void Pwm_Soltar(void)
 {
     poner_duty(&PWM6DCL, &PWM6DCH, 0);
     poner_duty(&PWM7DCL, &PWM7DCH, 0);
+    sentido = 0;
 }
 
 /* Decaimiento lento. El pin modulado va en alto cuando frena
@@ -52,6 +55,7 @@ void Pwm_AplicarMv(int16_t milivoltios)
     int32_t mag;
     uint16_t alto;
     uint16_t fijo;
+    int8_t nuevo;
 
     if (milivoltios > VM_MV) {
         milivoltios = VM_MV;
@@ -77,13 +81,28 @@ void Pwm_AplicarMv(int16_t milivoltios)
     fijo = 1023U;
 
     if (milivoltios > 0) {
+        nuevo = 1;
+    } else if (milivoltios < 0) {
+        nuevo = -1;
+    } else {
+        nuevo = 0;
+    }
+
+    /* Antes de invertir se sueltan las dos entradas, para no cruzarlas. */
+    if ((sentido != 0) && (nuevo != 0) && (sentido != nuevo)) {
+        poner_duty(&PWM6DCL, &PWM6DCH, 0);
+        poner_duty(&PWM7DCL, &PWM7DCH, 0);
+    }
+
+    if (nuevo > 0) {
         poner_duty(&PWM6DCL, &PWM6DCH, fijo);
         poner_duty(&PWM7DCL, &PWM7DCH, alto);
-    } else if (milivoltios < 0) {
+    } else if (nuevo < 0) {
         poner_duty(&PWM6DCL, &PWM6DCH, alto);
         poner_duty(&PWM7DCL, &PWM7DCH, fijo);
     } else {
         poner_duty(&PWM6DCL, &PWM6DCH, fijo);
         poner_duty(&PWM7DCL, &PWM7DCH, fijo);
     }
+    sentido = nuevo;
 }

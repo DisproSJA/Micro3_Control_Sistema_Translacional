@@ -18,25 +18,24 @@
 #define INVERTIR_GIRO                   0
 #define INVERTIR_ENCODER                0
 
-#define POS_MM_MAX                      100L
-#define POS_MM_MIN                      (-100L)
+#define POS_MM_MAX                      120L
+#define POS_MM_MIN                      (-120L)
 #define CUENTAS_MAX                     (POS_MM_MAX * CUENTAS_POR_MM)
 #define CUENTAS_MIN                     (POS_MM_MIN * CUENTAS_POR_MM)
 
-/* Kp = 1.5 V/mm, Ki = 0, Kd = 0.07. Van en milesimas: 1.5 -> 1500. */
+/* La mitad del carrito queda 19.8 mm adelante del punto que mide el encoder. */
+#define DESPLAZAMIENTO_CUENTAS          ((198L * CUENTAS_POR_MM) / 10L)
+
+/* PD del paso 0 a 100 mm. Kp = 1.5 V/mm, Ki = 0, Kd = 0.07, los de la simulacion.
+   Van en milesimas: 1.5 -> 1500, 0.07 -> 70. */
 #define KP_MILLI_INICIAL                1500
 #define KI_MILLI_INICIAL                0
 #define KD_MILLI_INICIAL                70
 
+/* La fuente es de 24 V. El PID no pasa de 8 V, que es el limite con el
+   que el control ya se probo. El PWM sigue calculado sobre los 24 V. */
 #define VM_MV                           24000
-
-/* Conteo del encoder con el carro en 0 mm. Lo imprime el comando C
-   y se pega aqui. Z mueve el motor hasta ver este conteo.
-   Al grabar o al reset el contador vuelve a 0: si en ese momento
-   el carro estaba en 0 mm, el valor correcto es 0. */
-#define CUENTAS_HOME                    0L
-#define HOME_TOL_CUENTAS                (CUENTAS_POR_MM / 10L)
-#define HOME_TIMEOUT_MUESTRAS           (8UL * FS_HZ)
+#define VLIM_MV                         8000
 
 /* 65536 - 8000000/150. El timer cuenta Fosc/4. */
 #define TMR0_RECARGA                    12203U

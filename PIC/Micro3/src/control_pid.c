@@ -69,7 +69,7 @@ uint8_t Control_FijarKd(int16_t valor)
     return 1;
 }
 
-/* Una muestra. Devuelve voltios en mV, ya recortados a ±24. */
+/* Una muestra. Devuelve voltios en mV, ya recortados a ±VLIM_MV. */
 int16_t Control_Calcular(int32_t consigna, int32_t posicion)
 {
     int32_t error;
@@ -94,6 +94,11 @@ int16_t Control_Calcular(int32_t consigna, int32_t posicion)
         i_mv = 0;
     } else {
         i_mv += ((int32_t)ki_milli * (error + e_prev)) / (DOS_SOBRE_TS * CUENTAS_POR_MM);
+        if (i_mv > VLIM_MV) {
+            i_mv = VLIM_MV;
+        } else if (i_mv < -VLIM_MV) {
+            i_mv = -VLIM_MV;
+        }
     }
 
     if (primera) {
@@ -120,13 +125,13 @@ int16_t Control_Calcular(int32_t consigna, int32_t posicion)
 
     u = p_mv + i_mv + d_mv;
     congelar = 0;
-    if (u > VM_MV) {
-        u = VM_MV;
+    if (u > VLIM_MV) {
+        u = VLIM_MV;
         if (error > 0) {
             congelar = 1;
         }
-    } else if (u < -VM_MV) {
-        u = -VM_MV;
+    } else if (u < -VLIM_MV) {
+        u = -VLIM_MV;
         if (error < 0) {
             congelar = 1;
         }
@@ -136,10 +141,10 @@ int16_t Control_Calcular(int32_t consigna, int32_t posicion)
     if (congelar) {
         i_mv = i_antes;
         u = p_mv + i_mv + d_mv;
-        if (u > VM_MV) {
-            u = VM_MV;
-        } else if (u < -VM_MV) {
-            u = -VM_MV;
+        if (u > VLIM_MV) {
+            u = VLIM_MV;
+        } else if (u < -VLIM_MV) {
+            u = -VLIM_MV;
         }
     }
 

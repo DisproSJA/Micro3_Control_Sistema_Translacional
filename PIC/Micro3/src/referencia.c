@@ -1,29 +1,41 @@
 #include "referencia.h"
 #include "configuracion.h"
 #include "encoder.h"
-#include "adc.h"
 #include "control_pid.h"
 
 #define MODO_PARADO                     0U
 #define MODO_DIGITAL                    1U
 #define MODO_ANALOGA                    2U
-#define MODO_HOME                       3U
 
 static uint8_t modo;
 static uint8_t homed;
 static uint8_t aviso;
-static uint16_t muestras;
 static int32_t consigna;
+static int32_t lim_min;
+static int32_t lim_max;
 
-/* Pot de 0 a 2.048 V. 0 cuentas del ADC son -100 mm. */
-static int32_t consigna_adc(void)
+/* Deja la consigna entre los dos finales de carrera. */
+static int32_t acotar(int32_t cuentas)
+{
+    if (cuentas > lim_max) {
+        return lim_max;
+    }
+    if (cuentas < lim_min) {
+        return lim_min;
+    }
+    return cuentas;
+}
+
+/* 0 cuentas = -120 mm, 2048 = 0 mm, 4095 = +120 mm. Una vuelta del pot. */
+static int32_t consigna_adc(uint16_t lectura)
 {
     int32_t cuentas;
-    uint16_t lectura;
 
-    lectura = Adc_Ver();
-    /* 0 del ADC es -100 mm y 2048 es el centro. */
-    cuentas = ((int32_t)lectura - 2048L) * CUENTAS_MAX / 2048L;
+    if (lectura > 4095U) {
+        lectura = 4095U;
+    }
+    cuentas = ((int32_t)lectura * (2L * CUENTAS_MAX)) / 4095L;
+    cuentas -= CUENTAS_MAX;
     if (cuentas > CUENTAS_MAX) {
         cuentas = CUENTAS_MAX;
     } else if (cuentas < CUENTAS_MIN) {
@@ -32,21 +44,30 @@ static int32_t consigna_adc(void)
     return cuentas;
 }
 
-/* Arranca sin cero. El encoder mide desde el Z, no desde el encendido. */
+/* El punto donde esta el carro al encender queda en 0 mm. */
 void Referencia_Iniciar(void)
 {
+    Encoder_FijarCero();
     modo = MODO_PARADO;
-    homed = 0;
+    homed = 1;
     aviso = REF_AVISO_NINGUNO;
-    muestras = 0;
     consigna = 0;
+    lim_min = CUENTAS_MIN;
+    lim_max = CUENTAS_MAX;
 }
 
 /* Suelta el motor y olvida I y D. */
-void Referencia_Parar(void)
+uint8_t Referencia_Parar(void)
 {
     modo = MODO_PARADO;
     Control_Reiniciar();
+    return 0;
+}
+
+/* Ya no hay falla que borrar. Se deja por el comando X. */
+uint8_t Referencia_BorrarFallo(void)
+{
+    return 0;
 }
 
 /* La consigna pasa a ser la ultima P. Si no hay cero, no corre. */
@@ -75,25 +96,58 @@ uint8_t Referencia_FijarDecimas(int16_t decimas)
     if (!homed) {
         return 0;
     }
-    if ((decimas < -1000) || (decimas > 1000)) {
+    if ((decimas < -1200) || (decimas > 1200)) {
         return 0;
     }
 
     cuentas = (int32_t)decimas * (CUENTAS_POR_MM / 10L);
-    consigna = cuentas;
+    consigna = acotar(cuentas);
     modo = MODO_DIGITAL;
     return 1;
 }
 
-/* Z suelta el PID viejo y sale a buscar CUENTAS_HOME. */
-void Referencia_IniciarHome(void)
+/* Los topes nuevos. El minimo tiene que quedar por debajo del maximo. */
+uint8_t Referencia_FijarLimites(int16_t min_d, int16_t max_d)
 {
-    Control_Reiniciar();
-    modo = MODO_HOME;
-    homed = 0;
-    aviso = REF_AVISO_NINGUNO;
-    muestras = 0;
-    consigna = 0;
+    if ((min_d < -1200) || (max_d > 1200) || (min_d >= max_d)) {
+        return 0;
+    }
+    lim_min = (int32_t)min_d * (CUENTAS_POR_MM / 10L);
+    lim_max = (int32_t)max_d * (CUENTAS_POR_MM / 10L);
+    consigna = acotar(consigna);
+    return 1;
+}
+
+/* El encoder mide el centro. Hacia el lado de la consigna se suman 19.8 mm. */
+int32_t Referencia_Posicion(int32_t cruda)
+{
+    if (consigna > 0) {
+        return cruda + DESPLAZAMIENTO_CUENTAS;
+    }
+    if (consigna < 0) {
+        return cruda - DESPLAZAMIENTO_CUENTAS;
+    }
+    return cruda;
+}
+
+/* En el tope no se empuja mas hacia afuera. Hacia adentro si se puede. */
+int16_t Referencia_AplicarFin(int32_t posicion, int16_t milivoltios)
+{
+    if ((posicion >= lim_max) && (milivoltios > 0)) {
+        return 0;
+    }
+    if ((posicion <= lim_min) && (milivoltios < 0)) {
+        return 0;
+    }
+    return milivoltios;
+}
+
+/* Z lleva el carro a 0 mm, el punto que se guardo al encender. */
+uint8_t Referencia_IrAlHome(void)
+{
+    consigna = acotar(0);
+    modo = MODO_DIGITAL;
+    return REF_Z_OK;
 }
 
 /* 1 despues de un Z. */
@@ -112,37 +166,19 @@ uint8_t Referencia_TomarAviso(void)
     return copia;
 }
 
-/* Cada Ts. En home la consigna es 0 mm, o sea el conteo quemado. */
-uint8_t Referencia_Actualizar(int32_t *consigna_out, int16_t *milivoltios)
+/* Cada Ts. En analogica la consigna sale del potenciometro. */
+uint8_t Referencia_Actualizar(int32_t *consigna_out, int16_t *milivoltios,
+                              uint16_t adc)
 {
-    int32_t pos;
-
     *consigna_out = consigna;
     *milivoltios = 0;
-
-    if (modo == MODO_HOME) {
-        pos = Encoder_Posicion();
-        muestras++;
-        if ((pos <= HOME_TOL_CUENTAS) && (pos >= -HOME_TOL_CUENTAS)) {
-            homed = 1;
-            modo = MODO_DIGITAL;
-            consigna = 0;
-            aviso = REF_AVISO_HOME;
-        } else if (muestras >= HOME_TIMEOUT_MUESTRAS) {
-            modo = MODO_PARADO;
-            aviso = REF_AVISO_FALLO;
-            return REF_COAST;
-        }
-        *consigna_out = consigna;
-        return REF_PID;
-    }
 
     if (!homed || (modo == MODO_PARADO)) {
         return REF_COAST;
     }
 
     if (modo == MODO_ANALOGA) {
-        consigna = consigna_adc();
+        consigna = acotar(consigna_adc(adc));
         *consigna_out = consigna;
     }
 

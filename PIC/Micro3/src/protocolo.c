@@ -50,7 +50,7 @@ static uint8_t leer_milesimas(const char *s, int32_t *milesimas)
     while ((*s >= '0') && (*s <= '9')) {
         alguno = 1;
         entero = (entero * 10UL) + (uint32_t)(*s - '0');
-        if (entero > 100UL) {
+        if (entero > 120UL) {
             return 0;
         }
         s++;
@@ -116,6 +116,49 @@ static void comando_p(const char *s)
     responder("OK\r\n");
 }
 
+/* F-80.0,60.0 fija el final de carrera inferior y el superior. */
+static void comando_fines(const char *s)
+{
+    char izq[16];
+    uint8_t i;
+    int32_t min_m;
+    int32_t max_m;
+    int16_t dmin;
+    int16_t dmax;
+
+    i = 0;
+    while ((s[i] != '\0') && (s[i] != ',') && (i < 15U)) {
+        izq[i] = s[i];
+        i++;
+    }
+    if ((s[i] != ',') || (i == 0U)) {
+        responder("ERR VALOR\r\n");
+        return;
+    }
+    izq[i] = '\0';
+    if (!leer_milesimas(izq, &min_m) || !leer_milesimas(&s[i + 1U], &max_m)) {
+        responder("ERR VALOR\r\n");
+        return;
+    }
+
+    if (min_m >= 0) {
+        dmin = (int16_t)((min_m + 50L) / 100L);
+    } else {
+        dmin = (int16_t)(-(((-min_m) + 50L) / 100L));
+    }
+    if (max_m >= 0) {
+        dmax = (int16_t)((max_m + 50L) / 100L);
+    } else {
+        dmax = (int16_t)(-(((-max_m) + 50L) / 100L));
+    }
+
+    if (!Referencia_FijarLimites(dmin, dmax)) {
+        responder("ERR RANGO\r\n");
+        return;
+    }
+    responder("OK\r\n");
+}
+
 /* Kp:1.5 guarda 1500. Kd no pasa de 2. */
 static void comando_ganancia(char cual, const char *s)
 {
@@ -148,7 +191,7 @@ static void comando_ganancia(char cual, const char *s)
     responder("OK\r\n");
 }
 
-/* ENC: y el conteo crudo. Ese numero se pega en CUENTAS_HOME. */
+/* ENC: y el conteo crudo, sin restar el cero de Z. */
 static void responder_conteo(int32_t valor)
 {
     char buf[20];
@@ -187,6 +230,22 @@ static void responder_conteo(int32_t valor)
     responder(buf);
 }
 
+/* A y B como los lee el PIC. Sirve para ver si el pin si cambia. */
+static void responder_ab(uint8_t nivel)
+{
+    char buf[8];
+
+    buf[0] = 'A';
+    buf[1] = 'B';
+    buf[2] = ':';
+    buf[3] = (char)('0' + (nivel & 1U));
+    buf[4] = (char)('0' + ((nivel >> 1) & 1U));
+    buf[5] = '\r';
+    buf[6] = '\n';
+    buf[7] = '\0';
+    responder(buf);
+}
+
 /* Una linea ya cerrada con enter. */
 static void ejecutar(void)
 {
@@ -204,13 +263,27 @@ static void ejecutar(void)
     if (c0 == 'P') {
         comando_p(&linea[1]);
     } else if ((c0 == 'S') && (linea[1] == '\0')) {
-        Referencia_Parar();
-        responder("OK\r\n");
+        if (Referencia_Parar()) {
+            responder("ERR FALLO\r\n");
+        } else {
+            responder("OK\r\n");
+        }
+    } else if ((c0 == 'X') && (linea[1] == '\0')) {
+        if (Referencia_BorrarFallo()) {
+            responder("OK\r\n");
+        } else {
+            responder("ERR VALOR\r\n");
+        }
     } else if ((c0 == 'C') && (linea[1] == '\0')) {
         responder_conteo(Encoder_Cuentas());
+        responder_ab(Encoder_Ab());
     } else if ((c0 == 'Z') && (linea[1] == '\0')) {
-        Referencia_IniciarHome();
-        responder("OK\r\n");
+        c0 = (char)Referencia_IrAlHome();
+        if (c0 == (char)REF_Z_OK) {
+            responder("OK HOME\r\n");
+        } else {
+            responder("ERR FALLO\r\n");
+        }
     } else if ((c0 == 'D') && (linea[1] == '\0')) {
         if (!Referencia_HayHome()) {
             responder("ERR HOME\r\n");
@@ -225,6 +298,8 @@ static void ejecutar(void)
             Referencia_FuenteAnalogica();
             responder("OK\r\n");
         }
+    } else if (c0 == 'F') {
+        comando_fines(&linea[1]);
     } else if ((c0 == 'K') && (largo >= 3U) && (linea[2] == ':') &&
                ((c1 == 'P') || (c1 == 'I') || (c1 == 'D'))) {
         comando_ganancia(c1, &linea[3]);
@@ -267,5 +342,7 @@ void Protocolo_AvisoHome(uint8_t aviso)
         responder("OK HOME\r\n");
     } else if (aviso == REF_AVISO_FALLO) {
         responder("ERR HOME\r\n");
+    } else if (aviso == REF_AVISO_PROTECCION) {
+        responder("ERR FALLO\r\n");
     }
 }
